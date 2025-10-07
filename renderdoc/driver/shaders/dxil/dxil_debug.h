@@ -58,6 +58,7 @@ struct ExecPointReference
   {
   }
   bool IsAfter(const ExecPointReference &from, const DXIL::ControlFlow &controlFlow) const;
+  bool IsValid() const { return block != ~0U && instruction != ~0U; }
 
   uint32_t block;
   uint32_t instruction;
@@ -91,7 +92,7 @@ struct InputData
 struct FunctionInfo
 {
   typedef std::set<Id> ReferencedIds;
-  typedef std::map<Id, ExecPointReference> ExecutionPointPerId;
+  typedef rdcarray<ExecPointReference> ExecutionPointPerId;
   typedef std::map<uint32_t, ReferencedIds> PhiReferencedIdsPerBlock;
   typedef rdcarray<rdcstr> Callstack;
 
@@ -122,6 +123,7 @@ struct GlobalVariable
 {
   Id id;
   ShaderVariable var;
+  bool gsm;
 };
 
 struct GlobalConstant
@@ -203,7 +205,9 @@ public:
 
 struct MemoryTracking
 {
-  void AllocateMemoryForType(const DXIL::Type *type, Id allocId, bool global, ShaderVariable &var);
+  void AllocateMemoryForType(const DXIL::Type *type, Id allocId, bool globalVar, bool gsm,
+                             ShaderVariable &var);
+  void ConvertGlobalAllocToLocal(Id allocId);
 
   // Represents actual memory allocations (think of it like a memory heap)
   struct Allocation
@@ -212,6 +216,7 @@ struct MemoryTracking
     void *backingMemory;
     uint64_t size;
     bool globalVarAlloc;
+    bool gsm;
     bool localMemory;
   };
 
@@ -259,6 +264,7 @@ struct ThreadState
   Id GetArgumentId(uint32_t i) const;
   ResourceReferenceInfo GetResource(Id handleId, bool &annotatedHandle);
   void FillCallstack(ShaderDebugState &state);
+  void RetireLiveIDs();
 
   bool GetShaderVariable(const DXIL::Value *dxilValue, DXIL::Operation op, DXIL::DXOp dxOpCode,
                          ShaderVariable &var, bool flushDenormInput = true) const
@@ -330,7 +336,7 @@ struct ThreadState
   GlobalVariable m_Output;
 
   // Known SSA ShaderVariables
-  std::map<Id, ShaderVariable> m_Variables;
+  rdcarray<ShaderVariable> m_Variables;
   // SSA Variables captured when a branch happens for use in phi nodes
   std::map<Id, ShaderVariable> m_PhiVariables;
   // Live variables at the current scope

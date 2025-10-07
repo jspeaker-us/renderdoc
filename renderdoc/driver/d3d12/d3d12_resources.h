@@ -721,6 +721,8 @@ class WrappedID3D12Heap : public WrappedDeviceChild12<ID3D12Heap, ID3D12Heap1>,
                           public ID3D12PageableTools
 {
   ID3D12PageableTools *m_Pageable = NULL;
+
+  ID3D12Resource *m_WholeMem = NULL;
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12Heap);
 
@@ -729,12 +731,12 @@ public:
     TypeEnum = Resource_Heap,
   };
 
-  WrappedID3D12Heap(ID3D12Heap *real, WrappedID3D12Device *device)
-      : WrappedDeviceChild12(real, device)
-  {
-  }
+  ID3D12Resource *GetUnwrappedWholeMemBuffer() { return m_WholeMem; }
+
+  WrappedID3D12Heap(ID3D12Heap *real, WrappedID3D12Device *device);
   virtual ~WrappedID3D12Heap()
   {
+    SAFE_RELEASE(m_WholeMem);
     SAFE_RELEASE(m_Pageable);
     Shutdown();
   }
@@ -942,7 +944,7 @@ public:
       return false;
     }
 
-    static void GetReflections(rdcarray<ShaderReflection *> &refls)
+    static void GetReflections(rdcarray<const ShaderReflection *> &refls)
     {
       refls.clear();
       for(auto it = m_Shaders.begin(); it != m_Shaders.end(); ++it)
@@ -987,7 +989,8 @@ public:
       return ret;
     }
 
-    DXBC::DXBCContainer *GetDXBC()
+    const DXBC::DXBCContainer *GetDXBC() { return GetWriteableDXBC(); }
+    DXBC::DXBCContainer *GetWriteableDXBC()
     {
       if(m_DXBCFile == NULL && !m_Bytecode.empty())
       {
@@ -996,7 +999,7 @@ public:
       }
       return m_DXBCFile;
     }
-    ShaderReflection &GetDetails()
+    const ShaderReflection &GetDetails()
     {
       if(!m_Built && GetDXBC() != NULL)
         BuildReflection();

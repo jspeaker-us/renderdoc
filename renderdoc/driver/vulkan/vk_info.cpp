@@ -854,7 +854,7 @@ uint32_t GetDescriptorSizeOfBind(VulkanResourceManager *resourceMan,
 }
 
 static void ProcessStaticDescriptorAccess(VulkanResourceManager *resourceMan,
-                                          ShaderReflection *refl, ResourceId specStorage,
+                                          const ShaderReflection *refl, ResourceId specStorage,
                                           rdcarray<DescriptorAccess> &descriptorAccess,
                                           rdcarray<const DescSetLayout *> setLayoutInfos)
 {
@@ -1424,13 +1424,22 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     viewportCount = 0;
 
   viewports.resize(viewportCount);
-  scissors.resize(viewportCount);
 
   for(uint32_t i = 0; i < viewportCount; i++)
   {
     if(pCreateInfo->pViewportState->pViewports)
       viewports[i] = pCreateInfo->pViewportState->pViewports[i];
+  }
 
+  if(pCreateInfo->pViewportState)
+    scissorCount = pCreateInfo->pViewportState->scissorCount;
+  else
+    scissorCount = 0;
+
+  scissors.resize(scissorCount);
+
+  for(uint32_t i = 0; i < scissorCount; i++)
+  {
     if(pCreateInfo->pViewportState->pScissors)
       scissors[i] = pCreateInfo->pViewportState->pScissors[i];
   }
@@ -1751,6 +1760,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         vertLayout = pipeInfo.vertLayout;
 
         viewportCount = pipeInfo.viewportCount;
+        scissorCount = pipeInfo.scissorCount;
         viewports = pipeInfo.viewports;
         scissors = pipeInfo.scissors;
 
@@ -2013,6 +2023,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
   tessellationDomainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
 
   viewportCount = 0;
+  scissorCount = 0;
 
   // VkPipelineRasterStateCreateInfo
   depthClampEnable = false;
@@ -2079,6 +2090,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
   tessellationDomainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
 
   viewportCount = 0;
+  scissorCount = 0;
 
   // VkPipelineRasterStateCreateInfo
   depthClampEnable = false;
@@ -2987,6 +2999,55 @@ void VulkanCreationInfo::AccelerationStructure::Init(
   offset = pCreateInfo->offset;
   size = pCreateInfo->size;
   type = pCreateInfo->type;
+}
+
+const VulkanCreationInfo::PipelineLayout &VulkanCreationInfo::GetPipelineLayoutInfo(ResourceId rp) const
+{
+  auto it = m_PipelineLayout.find(rp);
+  RDCASSERT(it != m_PipelineLayout.end());
+  return it->second;
+}
+
+const DescSetLayout &VulkanCreationInfo::GetDescSetLayout(ResourceId dsl) const
+{
+  auto it = m_DescSetLayout.find(dsl);
+  RDCASSERT(it != m_DescSetLayout.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::Buffer &VulkanCreationInfo::GetBufferInfo(ResourceId buf) const
+{
+  auto it = m_Buffer.find(buf);
+  RDCASSERT(it != m_Buffer.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::BufferView &VulkanCreationInfo::GetBufferViewInfo(ResourceId bufView) const
+{
+  auto it = m_BufferView.find(bufView);
+  RDCASSERT(it != m_BufferView.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::Image &VulkanCreationInfo::GetImageInfo(ResourceId img) const
+{
+  auto it = m_Image.find(img);
+  RDCASSERT(it != m_Image.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::ImageView &VulkanCreationInfo::GetImageViewInfo(ResourceId imgView) const
+{
+  auto it = m_ImageView.find(imgView);
+  RDCASSERT(it != m_ImageView.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::Sampler &VulkanCreationInfo::GetSamplerInfo(ResourceId samp) const
+{
+  auto it = m_Sampler.find(samp);
+  RDCASSERT(it != m_Sampler.end());
+  return it->second;
 }
 
 void DescUpdateTemplate::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,

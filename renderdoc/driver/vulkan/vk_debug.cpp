@@ -1853,16 +1853,12 @@ const VulkanCreationInfo::Buffer &VulkanDebugManager::GetBufferInfo(ResourceId i
 
 const VulkanCreationInfo::Image &VulkanDebugManager::GetImageInfo(ResourceId img) const
 {
-  auto it = m_pDriver->m_CreationInfo.m_Image.find(img);
-  RDCASSERT(it != m_pDriver->m_CreationInfo.m_Image.end());
-  return it->second;
+  return m_pDriver->m_CreationInfo.GetImageInfo(img);
 }
 
 const VulkanCreationInfo::ImageView &VulkanDebugManager::GetImageViewInfo(ResourceId imgView) const
 {
-  auto it = m_pDriver->m_CreationInfo.m_ImageView.find(imgView);
-  RDCASSERT(it != m_pDriver->m_CreationInfo.m_ImageView.end());
-  return it->second;
+  return m_pDriver->m_CreationInfo.GetImageViewInfo(imgView);
 }
 
 const VulkanCreationInfo::Pipeline &VulkanDebugManager::GetPipelineInfo(ResourceId pipe) const
@@ -1902,9 +1898,7 @@ const VulkanCreationInfo::RenderPass &VulkanDebugManager::GetRenderPassInfo(Reso
 
 const VulkanCreationInfo::PipelineLayout &VulkanDebugManager::GetPipelineLayoutInfo(ResourceId rp) const
 {
-  auto it = m_pDriver->m_CreationInfo.m_PipelineLayout.find(rp);
-  RDCASSERT(it != m_pDriver->m_CreationInfo.m_PipelineLayout.end());
-  return it->second;
+  return m_pDriver->m_CreationInfo.GetPipelineLayoutInfo(rp);
 }
 
 const VulkanCreationInfo::AccelerationStructure &VulkanDebugManager::GetAccelerationStructureInfo(
@@ -1917,9 +1911,7 @@ const VulkanCreationInfo::AccelerationStructure &VulkanDebugManager::GetAccelera
 
 const DescSetLayout &VulkanDebugManager::GetDescSetLayout(ResourceId dsl) const
 {
-  auto it = m_pDriver->m_CreationInfo.m_DescSetLayout.find(dsl);
-  RDCASSERT(it != m_pDriver->m_CreationInfo.m_DescSetLayout.end());
-  return it->second;
+  return m_pDriver->m_CreationInfo.GetDescSetLayout(dsl);
 }
 
 const WrappedVulkan::DescriptorSetInfo &VulkanDebugManager::GetDescSetInfo(ResourceId ds) const
@@ -5562,6 +5554,28 @@ void VulkanReplay::Feedback::Destroy(WrappedVulkan *driver)
 
 void ShaderDebugData::Init(WrappedVulkan *driver, VkDescriptorPool descriptorPool)
 {
+  VkResult vkr = VK_SUCCESS;
+  VkDescriptorPoolSize descPoolTypes[] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 5 * MAX_QUEUED_OPS},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, MAX_QUEUED_OPS},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_QUEUED_OPS},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAX_QUEUED_OPS},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_QUEUED_OPS},
+  };
+
+  VkDescriptorPoolCreateInfo descPoolInfo = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      NULL,
+      0,
+      MAX_QUEUED_OPS,
+      ARRAY_COUNT(descPoolTypes),
+      &descPoolTypes[0],
+  };
+
+  // create descriptor pool
+  vkr = driver->vkCreateDescriptorPool(driver->GetDev(), &descPoolInfo, NULL, &DescPool);
+  CHECK_VKR(driver, vkr);
+
   // should match the enum ShaderDebugBind
   CREATE_OBJECT(
       DescSetLayout,
@@ -5581,7 +5595,7 @@ void ShaderDebugData::Init(WrappedVulkan *driver, VkDescriptorPool descriptorPoo
           // ShaderDebugBind::Sampler
           {7, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
           // ShaderDebugBind::Constants
-          {8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+          {8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
           // ShaderDebugBind::MathResult
           {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
            VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -5589,9 +5603,8 @@ void ShaderDebugData::Init(WrappedVulkan *driver, VkDescriptorPool descriptorPoo
 
   CREATE_OBJECT(PipeLayout, DescSetLayout, sizeof(Vec4f) * 6 + sizeof(uint32_t));
 
-  CREATE_OBJECT(DescSet, descriptorPool, DescSetLayout);
-
-  VkResult vkr = VK_SUCCESS;
+  for(uint32_t i = 0; i < MAX_QUEUED_OPS; ++i)
+    CREATE_OBJECT(DescSets[i], DescPool, DescSetLayout);
 
   VkImageCreateInfo imInfo = {
       VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -5712,13 +5725,15 @@ void ShaderDebugData::Init(WrappedVulkan *driver, VkDescriptorPool descriptorPoo
   vkr = driver->vkCreateFramebuffer(driver->GetDev(), &fbinfo, NULL, &Framebuffer);
   CHECK_VKR(driver, vkr);
 
-  MathResult.Create(driver, driver->GetDev(), sizeof(Vec4f) * 4, 1,
+  VkDeviceSize resultMaxElementSize = sizeof(Vec4f) * 4;
+  MathResult.Create(driver, driver->GetDev(), resultMaxElementSize, 1,
                     GPUBuffer::eGPUBufferGPULocal | GPUBuffer::eGPUBufferSSBO);
 
   // don't need to ring this, as we hard-sync for readback anyway
-  ReadbackBuffer.Create(driver, driver->GetDev(), sizeof(Vec4f) * 4, 1,
+  uint32_t maxQueuedResults = 128;
+  ReadbackBuffer.Create(driver, driver->GetDev(), resultMaxElementSize * maxQueuedResults, 1,
                         GPUBuffer::eGPUBufferReadback);
-  ConstantsBuffer.Create(driver, driver->GetDev(), 1024, 1, 0);
+  ConstantsBuffer.Create(driver, driver->GetDev(), 1024, maxQueuedResults, 0);
   MathResult.Name("MathResult");
   ReadbackBuffer.Name("ShaderReadbackBuffer");
   ConstantsBuffer.Name("ShaderConstantsBuffer");
@@ -5748,4 +5763,7 @@ void ShaderDebugData::Destroy(WrappedVulkan *driver)
 
   for(auto it = m_Pipelines.begin(); it != m_Pipelines.end(); it++)
     driver->vkDestroyPipeline(driver->GetDev(), it->second, NULL);
+
+  if(DescPool != VK_NULL_HANDLE)
+    driver->vkDestroyDescriptorPool(driver->GetDev(), DescPool, NULL);
 }

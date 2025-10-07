@@ -30,6 +30,22 @@
 #include "spirv_common.h"
 #include "spirv_processor.h"
 
+#if defined(RELEASE)
+#define SPIRV_DEBUG_RDCASSERT(...) \
+  do                               \
+  {                                \
+    (void)(__VA_ARGS__);           \
+  } while((void)0, 0)
+#define SPIRV_DEBUG_RDCASSERTEQUAL(...) \
+  do                                    \
+  {                                     \
+    (void)(__VA_ARGS__);                \
+  } while((void)0, 0)
+#else
+#define SPIRV_DEBUG_RDCASSERT(...) RDCASSERTMSG("", __VA_ARGS__)
+#define SPIRV_DEBUG_RDCASSERTEQUAL(a, b) RDCASSERTEQUAL(a, b)
+#endif
+
 struct SPIRVInterfaceAccess;
 struct SPIRVPatchData;
 
@@ -58,6 +74,33 @@ enum class ThreadProperty : uint32_t
 
 ITERABLE_OPERATORS(ThreadProperty);
 
+enum class DeviceOpResult : uint32_t
+{
+  Unknown,
+  Succeeded,
+  Failed,
+  NeedsDevice,
+};
+
+inline void AtomicStore(int32_t *var, int32_t newVal)
+{
+  int32_t oldVal = *var;
+  while(Atomic::CmpExch32(var, oldVal, newVal) != oldVal)
+  {
+    oldVal = *var;
+  };
+}
+
+inline int32_t AtomicLoad(int32_t *var)
+{
+  return Atomic::CmpExch32(var, 0, 0);
+}
+
+inline int32_t AtomicLoad(const int32_t *var)
+{
+  return Atomic::CmpExch32((int32_t *)var, 0, 0);
+}
+
 struct ThreadState;
 
 class DebugAPIWrapper
@@ -68,25 +111,28 @@ public:
 
   virtual ResourceId GetShaderID() = 0;
 
-  virtual uint64_t GetBufferLength(ShaderBindIndex bind) = 0;
+  virtual uint64_t GetBufferLength(const ShaderBindIndex &bind) = 0;
 
-  virtual void ReadBufferValue(ShaderBindIndex bind, uint64_t offset, uint64_t byteSize,
+  virtual void ReadBufferValue(const ShaderBindIndex &bind, uint64_t offset, uint64_t byteSize,
                                void *dst) = 0;
-  virtual void WriteBufferValue(ShaderBindIndex bind, uint64_t offset, uint64_t byteSize,
+  virtual void WriteBufferValue(const ShaderBindIndex &bind, uint64_t offset, uint64_t byteSize,
                                 const void *src) = 0;
 
   virtual void ReadAddress(uint64_t address, uint64_t byteSize, void *dst) = 0;
   virtual void WriteAddress(uint64_t address, uint64_t byteSize, const void *src) = 0;
 
-  virtual bool ReadTexel(ShaderBindIndex imageBind, const ShaderVariable &coord, uint32_t sample,
-                         ShaderVariable &output) = 0;
-  virtual bool WriteTexel(ShaderBindIndex imageBind, const ShaderVariable &coord, uint32_t sample,
-                          const ShaderVariable &value) = 0;
+  virtual DeviceOpResult ReadTexel(const ShaderBindIndex &imageBind, const ShaderVariable &coord,
+                                   uint32_t sample, ShaderVariable &output) = 0;
+  virtual DeviceOpResult WriteTexel(const ShaderBindIndex &imageBind, const ShaderVariable &coord,
+                                    uint32_t sample, const ShaderVariable &value) = 0;
 
   virtual void FillInputValue(ShaderVariable &var, ShaderBuiltin builtin, uint32_t threadIndex,
                               uint32_t location, uint32_t component) = 0;
 
   virtual uint32_t GetThreadProperty(uint32_t threadIndex, ThreadProperty prop) = 0;
+  virtual bool IsImageCached(const ShaderBindIndex &bind) = 0;
+  virtual bool IsBufferCached(const ShaderBindIndex &bind) = 0;
+  virtual bool IsBufferCached(uint64_t address) = 0;
 
   enum TextureType
   {
@@ -99,16 +145,17 @@ public:
     Subpass_Texture = 0x20,
   };
 
-  virtual bool CalculateSampleGather(ThreadState &lane, Op opcode, TextureType texType,
-                                     ShaderBindIndex imageBind, ShaderBindIndex samplerBind,
-                                     const ShaderVariable &uv, const ShaderVariable &ddxCalc,
-                                     const ShaderVariable &ddyCalc, const ShaderVariable &compare,
-                                     GatherChannel gatherChannel,
-                                     const ImageOperandsAndParamDatas &operands,
-                                     ShaderVariable &output) = 0;
-
-  virtual bool CalculateMathOp(ThreadState &lane, GLSLstd450 op,
-                               const rdcarray<ShaderVariable> &params, ShaderVariable &output) = 0;
+  virtual bool QueueSampleGather(ThreadState &lane, Op opcode, TextureType texType,
+                                 const ShaderBindIndex &imageBind,
+                                 const ShaderBindIndex &samplerBind, const ShaderVariable &uv,
+                                 const ShaderVariable &ddxCalc, const ShaderVariable &ddyCalc,
+                                 const ShaderVariable &compare, GatherChannel gatherChannel,
+                                 const rdcspv::ImageOperandsAndParamDatas &operands,
+                                 ShaderVariable &output, bool &hasResult) = 0;
+  virtual bool QueueCalculateMathOp(GLSLstd450 op, const rdcarray<ShaderVariable> &params) = 0;
+  virtual bool GetQueuedResults(rdcarray<ShaderVariable *> &mathOpResults,
+                                rdcarray<ShaderVariable *> &sampleGatherResults) = 0;
+  virtual bool QueuedOpsHasSpace() = 0;
 };
 
 typedef ShaderVariable (*ExtInstImpl)(ThreadState &, uint32_t, const rdcarray<Id> &);
@@ -173,6 +220,30 @@ private:
   StackFrame &operator=(const StackFrame &o) = delete;
 };
 
+struct GpuMathOperation
+{
+  uint32_t workgroupIndex;
+  GLSLstd450 op;
+  rdcarray<ShaderVariable> paramVars;
+  ShaderVariable *result;
+};
+
+struct GpuSampleGatherOperation
+{
+  uint32_t workgroupIndex;
+  Op opcode;
+  DebugAPIWrapper::TextureType texType;
+  ShaderBindIndex imageBind;
+  ShaderBindIndex samplerBind;
+  ShaderVariable uv;
+  ShaderVariable ddxCalc;
+  ShaderVariable ddyCalc;
+  ShaderVariable compare;
+  GatherChannel gatherChannel;
+  ImageOperandsAndParamDatas operands;
+  ShaderVariable *result = NULL;
+};
+
 class Debugger;
 
 struct ThreadState
@@ -180,9 +251,8 @@ struct ThreadState
   ThreadState(Debugger &debug, const GlobalState &globalState);
   ~ThreadState();
 
-  void EnterEntryPoint(ShaderDebugState *state);
-  void StepNext(ShaderDebugState *state, const rdcarray<ThreadState> &workgroup,
-                const rdcarray<bool> &activeMask);
+  void EnterEntryPoint(bool useDebugState);
+  void StepNext(bool useDebugState, const uint32_t steps, const rdcarray<ThreadState> &workgroup);
 
   enum DerivDir
   {
@@ -205,6 +275,8 @@ struct ThreadState
   uint32_t currentInstruction;
   uint32_t nextInstruction;
 
+  rdcarray<bool> activeMask;
+
   const GlobalState &global;
   Debugger &debugger;
 
@@ -214,6 +286,7 @@ struct ThreadState
   // thread-local private variables
   rdcarray<ShaderVariable> privates;
 
+  // This must be a thread safe container
   // every ID's variable, if a pointer it may be pointing at a ShaderVariable stored elsewhere
   DenseIdMap<ShaderVariable> ids;
 
@@ -233,21 +306,17 @@ struct ThreadState
   };
   rdcarray<GSMIndex> gsmIndexes;
 
-  // the id of the merge block that the last branch targetted
-  Id mergeBlock;
-  uint32_t convergenceInstruction;
-  uint32_t functionReturnPoint;
+  bool IsDiverged() const { return diverged; };
+  const rdcarray<uint32_t> &GetEnteredPoints() const { return enteredPoints; }
+  uint32_t GetConvergenceInstruction() const { return convergenceInstruction; }
+  uint32_t GetFunctionReturnPoint() const { return functionReturnPoint; }
+
   ShaderVariable returnValue;
   bool hasReturnValueData;
   rdcarray<StackFrame *> callstack;
 
   // the list of IDs that are currently valid and live
   rdcarray<Id> live;
-
-  // true if executed an operation which could trigger divergence
-  bool diverged;
-  // list of potential convergence points that were entered in a single step (used for tracking thread convergence)
-  rdcarray<uint32_t> enteredPoints;
 
   std::map<Id, uint32_t> lastWrite;
 
@@ -266,10 +335,100 @@ struct ThreadState
   bool elected = false;
 
   const ShaderVariable &GetSrc(Id id) const;
-  void WritePointerValue(Id pointer, const ShaderVariable &val);
-  ShaderVariable ReadPointerValue(Id pointer);
+  DeviceOpResult WritePointerValue(Id pointer, const ShaderVariable &val);
+  DeviceOpResult ReadPointerValue(Id pointer, ShaderVariable &ret);
 
   void DebugBreak();
+
+  enum class PendingResultStatus : int32_t
+  {
+    Unknown,
+    Pending,
+    Ready,
+    Stepped,
+  };
+
+  void QueueMathOp(GLSLstd450 op, const rdcarray<ShaderVariable> &paramVars,
+                   const ShaderVariable &result);
+  void QueueSampleGather(Op opcode, DebugAPIWrapper::TextureType texType,
+                         const ShaderBindIndex &imageBind, const ShaderBindIndex &samplerBind,
+                         const ShaderVariable &uv, const ShaderVariable &ddxCalc,
+                         const ShaderVariable &ddyCalc, const ShaderVariable &compare,
+                         GatherChannel gatherChannel, const ImageOperandsAndParamDatas &operands,
+                         const ShaderVariable &result);
+
+  bool IsPendingResultPending() const
+  {
+    return GetPendingResultStatus() == PendingResultStatus::Pending;
+  }
+  bool IsPendingResultReady() const
+  {
+    return GetPendingResultStatus() == PendingResultStatus::Ready;
+  }
+  void SetPendingResultUnknown() { SetPendingResultStatus(PendingResultStatus::Unknown); }
+  void SetPendingResultReady()
+  {
+    SPIRV_DEBUG_RDCASSERTEQUAL(GetPendingResultStatus(), PendingResultStatus::Pending);
+    SetPendingResultStatus(PendingResultStatus::Ready);
+  }
+  const ShaderVariable &GetPendingResult() const
+  {
+    SPIRV_DEBUG_RDCASSERTEQUAL(GetPendingResultStatus(), PendingResultStatus::Ready);
+    return pendingResultData;
+  }
+  void SetStepQueued()
+  {
+    AtomicStore(&atomic_isSimulationStepActive, 1);
+    AtomicStore(&atomic_stepNeedsGpuSampleGatherOp, 0);
+    AtomicStore(&atomic_stepNeedsGpuMathOp, 0);
+    AtomicStore(&atomic_stepNeedsDeviceThread, 0);
+  }
+  void SetStepNeedsGpuSampleGatherOp()
+  {
+    AtomicStore(&atomic_stepNeedsGpuSampleGatherOp, 1);
+    SetPendingResultStatus(PendingResultStatus::Pending);
+  }
+  bool StepNeedsGpuSampleGatherOp() const
+  {
+    return (AtomicLoad(&atomic_stepNeedsGpuSampleGatherOp) == 1);
+  }
+  void SetStepNeedsGpuMathOp()
+  {
+    AtomicStore(&atomic_stepNeedsGpuMathOp, 1);
+    SetPendingResultStatus(PendingResultStatus::Pending);
+  }
+  bool StepNeedsGpuMathOp() const { return (AtomicLoad(&atomic_stepNeedsGpuMathOp) == 1); }
+  void SetStepNeedsDeviceThread()
+  {
+    AtomicStore(&atomic_stepNeedsDeviceThread, 1);
+    SetPendingResultStatus(PendingResultStatus::Pending);
+  }
+  bool StepNeedsDeviceThread() const { return (AtomicLoad(&atomic_stepNeedsDeviceThread) == 1); }
+  const GpuMathOperation &GetQueuedGpuMathOp() const
+  {
+    SPIRV_DEBUG_RDCASSERT(AtomicLoad(&atomic_stepNeedsGpuMathOp));
+    SPIRV_DEBUG_RDCASSERT(IsPendingResultPending());
+    return queuedGpuMathOp;
+  }
+  const GpuSampleGatherOperation &GetQueuedGpuSampleGatherOp() const
+  {
+    SPIRV_DEBUG_RDCASSERT(AtomicLoad(&atomic_stepNeedsGpuSampleGatherOp));
+    SPIRV_DEBUG_RDCASSERT(IsPendingResultPending());
+    return queuedGpuSampleGatherOp;
+  }
+
+  bool CanRunAnotherStep() const;
+
+  void SetSimulationStepCompleted() { AtomicStore(&atomic_isSimulationStepActive, 0); }
+  bool IsSimulationStepActive() const { return (AtomicLoad(&atomic_isSimulationStepActive) == 1); }
+
+  void ClearPendingDebugState()
+  {
+    pendingDebugState.changes.clear();
+    pendingDebugState.flags = ShaderEvents::NoEvent;
+    pendingDebugState.nextInstruction = 0;
+  }
+  const ShaderDebugState &GetPendingDebugState() const { return pendingDebugState; }
 
 private:
   void EnterFunction(const rdcarray<Id> &arguments);
@@ -284,7 +443,39 @@ private:
   void ExecuteMemoryBarrier(Id semanticsId);
   static bool WorkgroupIsDiverged(const rdcarray<ThreadState> &workgroup);
 
-  ShaderDebugState *m_State = NULL;
+  PendingResultStatus GetPendingResultStatus() const
+  {
+    return (PendingResultStatus)AtomicLoad(&atomic_pendingResultStatus);
+  }
+
+  void SetPendingResultStatus(PendingResultStatus status)
+  {
+    AtomicStore(&atomic_pendingResultStatus, (int32_t)status);
+  }
+
+  ShaderDebugState pendingDebugState;
+  bool hasDebugState = false;
+  uint32_t stepIndex = 0;
+  ShaderVariable pendingResultData;
+  GpuMathOperation queuedGpuMathOp;
+  GpuSampleGatherOperation queuedGpuSampleGatherOp;
+
+  // Control Flow state variables
+  // true if executed an operation which could trigger divergence
+  bool diverged;
+  // list of potential convergence points that were entered in a single step (used for tracking thread convergence)
+  rdcarray<uint32_t> enteredPoints;
+  // the id of the merge block that the last branch targetted
+  uint32_t convergenceInstruction;
+  // the instruction after a function call is defined to be a convergence point
+  uint32_t functionReturnPoint;
+
+  // These need to be accessed using atomics
+  int32_t atomic_pendingResultStatus = (int32_t)PendingResultStatus::Unknown;
+  int32_t atomic_stepNeedsGpuSampleGatherOp = 0;
+  int32_t atomic_stepNeedsGpuMathOp = 0;
+  int32_t atomic_stepNeedsDeviceThread = 0;
+  int32_t atomic_isSimulationStepActive = 0;
 };
 
 enum class DebugScope
@@ -394,6 +585,21 @@ struct LocalData
 Id ParseRawName(const rdcstr &name);
 rdcstr GetRawName(Id id);
 
+struct DebugMessage
+{
+  MessageCategory cat;
+  MessageSeverity sev;
+  MessageSource src;
+  rdcstr desc;
+};
+
+enum class StepThreadMode
+{
+  RUN_SINGLE_STEP,
+  RUN_MULTIPLE_STEPS,
+  QUEUE_MULTIPLE_STEPS
+};
+
 class Debugger : public Processor, public ShaderDebugger
 {
 public:
@@ -408,21 +614,21 @@ public:
 
   rdcarray<ShaderDebugState> ContinueDebug();
 
-  Iter GetIterForInstruction(uint32_t inst);
-  uint32_t GetInstructionForIter(Iter it);
-  uint32_t GetInstructionForFunction(Id id);
-  uint32_t GetInstructionForLabel(Id id);
-  const DataType &GetType(Id typeId);
-  const DataType &GetTypeForId(Id ssaId);
-  const Decorations &GetDecorations(Id typeId);
+  ConstIter GetIterForInstruction(uint32_t inst) const;
+  uint32_t GetInstructionForIter(ConstIter it) const;
+  uint32_t GetInstructionForFunction(Id id) const;
+  uint32_t GetInstructionForLabel(Id id) const;
+  const DataType &GetType(Id typeId) const;
+  const DataType &GetTypeForId(Id ssaId) const;
+  const Decorations &GetDecorations(Id typeId) const;
   bool IsDebugExtInstSet(Id id) const;
   bool HasDebugInfo() const { return m_DebugInfo.valid; }
   bool InDebugScope(uint32_t inst) const;
-  rdcstr GetHumanName(Id id);
-  void AllocateVariable(Id id, Id typeId, ShaderVariable &outVar);
+  rdcstr GetHumanName(Id id) const;
+  void AllocateVariable(Id id, Id typeId, ShaderVariable &outVar) const;
 
-  ShaderVariable ReadFromPointer(const ShaderVariable &v) const;
-  ShaderVariable GetPointerValue(const ShaderVariable &v) const;
+  DeviceOpResult ReadFromPointer(const ShaderVariable &ptr, ShaderVariable &ret) const;
+  DeviceOpResult GetPointerValue(const ShaderVariable &v, ShaderVariable &ret) const;
   uint64_t GetPointerByteOffset(const ShaderVariable &ptr) const;
   DebugAPIWrapper::TextureType GetTextureType(const ShaderVariable &img) const;
   ShaderVariable MakePointerVariable(Id id, const ShaderVariable *v, uint8_t scalar0 = 0xff,
@@ -434,16 +640,32 @@ public:
   bool IsPhysicalPointer(const ShaderVariable &v) const;
 
   bool ArePointersAndEqual(const ShaderVariable &a, const ShaderVariable &b) const;
-  void WriteThroughPointer(ShaderVariable &ptr, const ShaderVariable &val);
-  ShaderVariable MakeCompositePointer(const ShaderVariable &base, Id id, rdcarray<uint32_t> &indices);
+  DeviceOpResult WriteThroughPointer(ShaderVariable &ptr, const ShaderVariable &val) const;
+  ShaderVariable MakeCompositePointer(const ShaderVariable &base, Id id,
+                                      rdcarray<uint32_t> &indices) const;
 
-  DebugAPIWrapper *GetAPIWrapper() { return apiWrapper; }
-  uint32_t GetNumInstructions() { return (uint32_t)instructionOffsets.size(); }
-  GlobalState GetGlobal() { return global; }
-  const rdcarray<Id> &GetLiveGlobals() { return liveGlobals; }
+  DebugAPIWrapper *GetAPIWrapper() const;
+  uint32_t GetNumInstructions() const { return (uint32_t)instructionOffsets.size(); }
+  GlobalState GetGlobal() const { return global; }
+  const rdcarray<Id> &GetLiveGlobals() const { return liveGlobals; }
   ThreadState &GetActiveLane() { return workgroup[activeLaneIndex]; }
   const ThreadState &GetActiveLane() const { return workgroup[activeLaneIndex]; }
   uint32_t GetSubgroupSize() const { return subgroupSize; }
+
+  void QueueGpuMathOp(uint32_t lane);
+  void QueueGpuSampleGatherOp(uint32_t lane);
+
+  uint64_t GetDeviceThreadID() const { return deviceThreadID; }
+  bool IsDeviceThread() const { return Threading::GetCurrentID() == GetDeviceThreadID(); }
+  void AddDebugMessage(MessageCategory cat, MessageSeverity sev, MessageSource src, rdcstr desc) const;
+  void FillInputValue(ShaderVariable &var, ShaderBuiltin builtin, uint32_t threadIndex) const;
+  DeviceOpResult ReadTexel(const ShaderBindIndex &imageBind, const ShaderVariable &coord,
+                           uint32_t sample, ShaderVariable &output) const;
+  DeviceOpResult WriteTexel(const ShaderBindIndex &imageBind, const ShaderVariable &coord,
+                            uint32_t sample, const ShaderVariable &input) const;
+  DeviceOpResult GetBufferLength(const ShaderBindIndex &bind, uint64_t &bufferLen) const;
+
+  Threading::CriticalSection &GetAtomicMemoryLock() const { return atomicMemoryLock; }
 private:
   virtual void PreParse(uint32_t maxId);
   virtual void PostParse();
@@ -462,9 +684,9 @@ private:
 
   void MakeSignatureNames(const rdcarray<SPIRVInterfaceAccess> &sigList, rdcarray<rdcstr> &sigNames);
 
-  void FillCallstack(ThreadState &thread, ShaderDebugState &state);
-  void FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo);
-  void FillDefaultSourceVars(rdcarray<InstructionSourceInfo> &instInfo);
+  void FillCallstack(ThreadState &thread, ShaderDebugState &state) const;
+  void FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) const;
+  void FillDefaultSourceVars(rdcarray<InstructionSourceInfo> &instInfo) const;
 
   /////////////////////////////////////////////////////////
   // debug data
@@ -522,8 +744,9 @@ private:
 
   rdcarray<size_t> instructionOffsets;
 
-  std::set<rdcstr> usedNames;
-  std::map<Id, rdcstr> dynamicNames;
+  mutable std::set<rdcstr> usedNames;
+  mutable Threading::RWLock dynamicNamesLock;
+  mutable std::map<Id, rdcstr> dynamicNames;
 
   struct
   {
@@ -558,6 +781,43 @@ private:
   rdcshaders::ControlFlow controlFlow;
 
   const ScopeData *GetScope(size_t offset) const;
+
+  void ClampScalars(const ShaderVariable &var, uint8_t &scalar0) const;
+  void ClampScalars(const ShaderVariable &var, uint8_t &scalar0, uint8_t &scalar1) const;
+
+  void QueueDeviceThreadStep(uint32_t lane);
+  void ProcessQueuedDeviceThreadSteps();
+
+  void QueueJob(uint32_t lane);
+  void StepThread(uint32_t lane, StepThreadMode stepMode);
+  void InternalStepThread(uint32_t lane);
+  void SimulationJobHelper();
+
+  void ProcessQueuedDebugMessages();
+  void ProcessQueuedOps();
+  void ProcessQueuedGpuMathOps();
+  void ProcessQueuedGpuSampleGatherOps();
+  void SyncPendingGpuOps();
+  void SyncPendingLanes();
+
+  mutable Threading::CriticalSection atomicMemoryLock;
+  mutable Threading::CriticalSection queuedDebugMessagesLock;
+  mutable rdcarray<DebugMessage> queuedDebugMessages;
+  rdcarray<bool> queuedGpuMathOps;
+  rdcarray<bool> queuedGpuSampleGatherOps;
+  rdcarray<bool> queuedDeviceThreadSteps;
+  rdcarray<ShaderDebugState> *shaderChangesReturn;
+  rdcarray<int32_t> queuedJobs;
+
+  bool retireIDs = true;
+  ShaderDebugState activeDebugState;
+  rdcarray<bool> pendingLanes;
+  rdcarray<ShaderVariable *> pendingGpuMathsOpsResults;
+  rdcarray<ShaderVariable *> pendingGpuSampleGatherOpsResults;
+
+  uint64_t deviceThreadID;
+  int32_t atomic_simulationFinished;
+  bool mtSimulation;
 };
 
 // this does a 'safe' value assignment, by doing parallel depth-first iteration of both variables
@@ -566,3 +826,7 @@ private:
 void AssignValue(ShaderVariable &dst, const ShaderVariable &src);
 
 };    // namespace rdcspv
+
+DECLARE_REFLECTION_ENUM(rdcspv::ThreadState::PendingResultStatus);
+DECLARE_REFLECTION_ENUM(rdcspv::StepThreadMode);
+DECLARE_REFLECTION_ENUM(rdcspv::DeviceOpResult);

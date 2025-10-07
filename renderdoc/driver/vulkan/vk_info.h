@@ -242,8 +242,8 @@ struct VulkanCreationInfo
     ResourceId module;
     ShaderStage stage = ShaderStage::Count;
     rdcstr entryPoint;
-    ShaderReflection *refl = NULL;
-    SPIRVPatchData *patchData = NULL;
+    const ShaderReflection *refl = NULL;
+    const SPIRVPatchData *patchData = NULL;
 
     VkPipelineShaderStageCreateFlags flags;
 
@@ -364,6 +364,7 @@ struct VulkanCreationInfo
 
     // VkPipelineViewportStateCreateInfo
     uint32_t viewportCount;
+    uint32_t scissorCount;
     rdcarray<VkViewport> viewports;
     rdcarray<VkRect2D> scissors;
 
@@ -865,4 +866,11 @@ struct VulkanCreationInfo
     m_DescUpdateTemplate.erase(id);
     m_Queue.erase(id);
   }
+  const PipelineLayout &GetPipelineLayoutInfo(ResourceId rp) const;
+  const DescSetLayout &GetDescSetLayout(ResourceId dsl) const;
+  const Buffer &GetBufferInfo(ResourceId buf) const;
+  const BufferView &GetBufferViewInfo(ResourceId bufView) const;
+  const Image &GetImageInfo(ResourceId img) const;
+  const ImageView &GetImageViewInfo(ResourceId imgView) const;
+  const Sampler &GetSamplerInfo(ResourceId samp) const;
 };

@@ -2661,6 +2661,14 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_ROBUSTNESS_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(vertexAttributeRobustness);
+      }
+      END_PHYS_EXT_CHECK();
+
       BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVulkanMemoryModelFeatures,
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES);
       {
@@ -3611,6 +3619,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_9_FEATURES_KHR);
       {
         CHECK_PHYS_EXT_FEATURE(maintenance9);
+        m_Maintenance9 |= ext->maintenance9 != VK_FALSE;
       }
       END_PHYS_EXT_CHECK();
 

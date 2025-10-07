@@ -39,7 +39,6 @@ RDOC_CONFIG(rdcstr, Vulkan_Debug_PSDebugDumpDirPath, "",
             "Path to dump shader debugging generated SPIR-V files.");
 RDOC_CONFIG(bool, Vulkan_Debug_ShaderDebugLogging, false,
             "Output verbose debug logging messages when debugging shaders.");
-RDOC_EXTERN_CONFIG(bool, Vulkan_Hack_EnableGroupCaps);
 
 // needed for old linux compilers
 namespace std
@@ -123,6 +122,13 @@ struct ShaderUniformParameters
   float minlod;
 };
 
+#if defined(RELEASE)
+#define CHECK_DEVICE_THREAD()
+#else
+#define CHECK_DEVICE_THREAD() \
+  RDCASSERTMSG("API Wrapper function called from non-device thread!", IsDeviceThread());
+#endif    // #if defined(RELEASE)
+
 class VulkanAPIWrapper : public rdcspv::DebugAPIWrapper
 {
 public:
@@ -131,7 +137,8 @@ public:
       : m_DebugData(vk->GetReplay()->GetShaderDebugData()),
         m_Creation(creation),
         m_EventID(eid),
-        m_ShaderID(shadId)
+        m_ShaderID(shadId),
+        deviceThreadID(Threading::GetCurrentID())
   {
     m_pDriver = vk;
 
@@ -208,7 +215,7 @@ public:
           continue;
 
         const VulkanCreationInfo::PipelineLayout &pipeLayoutInfo =
-            m_Creation.m_PipelineLayout[srcData.pipeLayout];
+            m_Creation.GetPipelineLayoutInfo(srcData.pipeLayout);
 
         ResourceId setOrig = m_pDriver->GetResourceManager()->GetOriginalID(sourceSet);
 
@@ -218,7 +225,7 @@ public:
         for(size_t b = 0; b < bindStorage.binds.size(); b++)
         {
           const DescSetLayout::Binding &layoutBind =
-              m_Creation.m_DescSetLayout[pipeLayoutInfo.descSetLayouts[i]].bindings[b];
+              m_Creation.GetDescSetLayout(pipeLayoutInfo.descSetLayouts[i]).bindings[b];
 
           if(layoutBind.layoutDescType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
              layoutBind.layoutDescType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
@@ -246,10 +253,16 @@ public:
         }
       }
     }
+    RDCASSERT(ShaderDebugData::MAX_QUEUED_OPS * mathOpResultByteSize <
+              m_DebugData.ReadbackBuffer.TotalSize());
+    RDCASSERT(sampleGatherOpResultsStart +
+                  ShaderDebugData::MAX_QUEUED_OPS * sampleGatherOpResultByteSize <
+              m_DebugData.ReadbackBuffer.TotalSize());
   }
 
   ~VulkanAPIWrapper()
   {
+    CHECK_DEVICE_THREAD();
     m_pDriver->FlushQ();
 
     VkDevice dev = m_pDriver->GetDev();
@@ -261,6 +274,7 @@ public:
 
   void ResetReplay()
   {
+    CHECK_DEVICE_THREAD();
     if(!m_ResourcesDirty)
     {
       VkMarkerRegion region("ResetReplay");
@@ -271,282 +285,375 @@ public:
     m_ResourcesDirty = true;
   }
 
-  virtual void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src,
-                               rdcstr d) override
+  virtual void AddDebugMessage(MessageCategory cat, MessageSeverity sev, MessageSource src,
+                               rdcstr desc) override
   {
-    m_pDriver->AddDebugMessage(c, sv, src, d);
+    CHECK_DEVICE_THREAD();
+    m_pDriver->AddDebugMessage(cat, sev, src, desc);
   }
 
   virtual ResourceId GetShaderID() override { return m_ShaderID; }
 
-  virtual uint64_t GetBufferLength(ShaderBindIndex bind) override
+  virtual uint64_t GetBufferLength(const ShaderBindIndex &bind) override
   {
-    return PopulateBuffer(bind).size();
+    rdcspv::DeviceOpResult opResult;
+    size_t length = 0;
+    // BufferFunction guarantees the buffer cache readlock whilst the function is called
+    bool succeeded = BufferFunction(
+        bind, [&length](bytebuf *data) { length = data->size(); }, opResult);
+    RDCASSERT(succeeded);
+    RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Succeeded);
+    return length;
   }
 
-  virtual void ReadBufferValue(ShaderBindIndex bind, uint64_t offset, uint64_t byteSize,
+  virtual void ReadBufferValue(const ShaderBindIndex &bind, uint64_t offset, uint64_t byteSize,
                                void *dst) override
   {
-    const bytebuf &data = PopulateBuffer(bind);
-
-    if(offset + byteSize <= data.size())
-      memcpy(dst, data.data() + (size_t)offset, (size_t)byteSize);
+    rdcspv::DeviceOpResult opResult;
+    // BufferFunction guarantees the buffer cache readlock whilst the function is called
+    bool succeeded = BufferFunction(
+        bind,
+        [offset, byteSize, dst](bytebuf *data) {
+          if(offset + byteSize <= data->size())
+            memcpy(dst, data->data() + (size_t)offset, (size_t)byteSize);
+        },
+        opResult);
+    RDCASSERT(succeeded);
+    RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Succeeded);
   }
 
-  virtual void WriteBufferValue(ShaderBindIndex bind, uint64_t offset, uint64_t byteSize,
+  virtual void WriteBufferValue(const ShaderBindIndex &bind, uint64_t offset, uint64_t byteSize,
                                 const void *src) override
   {
-    bytebuf &data = PopulateBuffer(bind);
-
-    if(offset + byteSize <= data.size())
-      memcpy(data.data() + (size_t)offset, src, (size_t)byteSize);
+    rdcspv::DeviceOpResult opResult;
+    // BufferFunction guarantees the buffer cache readlock whilst the function is called
+    bool succeeded = BufferFunction(
+        bind,
+        [offset, byteSize, src](bytebuf *data) {
+          if(offset + byteSize <= data->size())
+            memcpy(data->data() + (size_t)offset, src, (size_t)byteSize);
+        },
+        opResult);
+    RDCASSERT(succeeded);
+    RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Succeeded);
   }
 
   virtual void ReadAddress(uint64_t address, uint64_t byteSize, void *dst) override
   {
-    size_t offset;
-    const bytebuf &data = PopulateBuffer(address, offset);
-    if(offset + byteSize <= data.size())
-      memcpy(dst, data.data() + offset, (size_t)byteSize);
+    rdcspv::DeviceOpResult opResult;
+    // BufferFunction guarantees the buffer cache readlock whilst the function is called
+    bool succeeded = BufferFunction(
+        address,
+        [byteSize, dst](bytebuf *data, size_t offset) {
+          if(offset + byteSize <= data->size())
+            memcpy(dst, data->data() + offset, (size_t)byteSize);
+        },
+        opResult);
+    RDCASSERT(succeeded);
+    RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Succeeded);
   }
 
   virtual void WriteAddress(uint64_t address, uint64_t byteSize, const void *src) override
   {
-    size_t offset;
-    bytebuf &data = PopulateBuffer(address, offset);
-    if(offset + byteSize <= data.size())
-      memcpy(data.data() + offset, src, (size_t)byteSize);
+    rdcspv::DeviceOpResult opResult;
+    // BufferFunction guarantees the buffer cache readlock whilst the function is called
+    bool succeeded = BufferFunction(
+        address,
+        [byteSize, src](bytebuf *data, size_t offset) {
+          if(offset + byteSize <= data->size())
+            memcpy(data->data() + offset, src, (size_t)byteSize);
+        },
+        opResult);
+    RDCASSERT(succeeded);
+    RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Succeeded);
   }
 
-  virtual bool ReadTexel(ShaderBindIndex imageBind, const ShaderVariable &coord, uint32_t sample,
-                         ShaderVariable &output) override
+  // Called from any thread
+  // Caller guarantees that if the image data is not cached then we are on the device thread
+  virtual rdcspv::DeviceOpResult ReadTexel(const ShaderBindIndex &imageBind,
+                                           const ShaderVariable &coord, uint32_t sample,
+                                           ShaderVariable &output) override
   {
-    ImageData &data = PopulateImage(imageBind);
-
-    if(data.width == 0)
-      return false;
-
-    uint32_t coords[4];
-    for(int i = 0; i < 4; i++)
-      coords[i] = uintComp(coord, i);
-
-    if(coords[0] > data.width || coords[1] > data.height || coords[2] > data.depth)
+    rdcspv::DeviceOpResult opResult;
+    bool isCached = false;
     {
-      m_pDriver->AddDebugMessage(
-          MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
-          StringFormat::Fmt(
-              "Out of bounds access to image, coord %u,%u,%u outside of dimensions %ux%ux%u",
-              coords[0], coords[1], coords[2], data.width, data.height, data.depth));
-      return false;
+      SCOPED_READLOCK(imageCacheLock);
+      isCached = GetImageDataFromCache(imageBind, opResult) != NULL;
+      RDCASSERTNOTEQUAL(opResult, rdcspv::DeviceOpResult::NeedsDevice);
     }
 
-    CompType varComp = VarTypeCompType(output.type);
-
-    set0001(output);
-
-    ShaderVariable input;
-    input.columns = data.fmt.compCount;
-
-    // the only 'irregular' format we need to worry about handling for integer types is 10:10:10:2.
-    // All others are float/uint
-    if(data.fmt.type == ResourceFormatType::R10G10B10A2)
+    if(!isCached)
     {
-      PixelValue val;
-      DecodePixelData(data.fmt, data.texel(coords, sample), val);
+      // Add image data to the cache : cache should not be locked by this thread
+      PopulateImage(imageBind);
+    }
 
-      if(data.fmt.compType == CompType::UInt)
-        input.type = VarType::UInt;
+    {
+      SCOPED_READLOCK(imageCacheLock);
+      ImageData *result = GetImageDataFromCache(imageBind, opResult);
+      if(!result)
+      {
+        RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Failed);
+        return rdcspv::DeviceOpResult::Failed;
+      }
+
+      ImageData &data = *result;
+      if(data.width == 0)
+        return rdcspv::DeviceOpResult::Failed;
+
+      uint32_t coords[4];
+      for(int i = 0; i < 4; i++)
+        coords[i] = uintComp(coord, i);
+
+      if(coords[0] >= data.width || coords[1] >= data.height || coords[2] >= data.depth)
+      {
+        if(!IsDeviceThread())
+          return rdcspv::DeviceOpResult::NeedsDevice;
+
+        CHECK_DEVICE_THREAD();
+        m_pDriver->AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt(
+                "Out of bounds access to image, coord %u,%u,%u outside of dimensions %ux%ux%u",
+                coords[0], coords[1], coords[2], data.width, data.height, data.depth));
+        return rdcspv::DeviceOpResult::Failed;
+      }
+
+      CompType varComp = VarTypeCompType(output.type);
+
+      set0001(output);
+
+      ShaderVariable input;
+      input.columns = data.fmt.compCount;
+
+      // the only 'irregular' format we need to worry about handling for integer types is
+      // 10:10:10:2. All others are float/uint
+      if(data.fmt.type == ResourceFormatType::R10G10B10A2)
+      {
+        PixelValue val;
+        DecodePixelData(data.fmt, data.texel(coords, sample), val);
+
+        if(data.fmt.compType == CompType::UInt)
+          input.type = VarType::UInt;
+        else if(data.fmt.compType == CompType::SInt)
+          input.type = VarType::SInt;
+        else
+          input.type = VarType::Float;
+
+        memcpy(input.value.u32v.data(), val.uintValue.data(), val.uintValue.byteSize());
+
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
+        {
+          if(data.fmt.compType == CompType::UInt)
+            setUintComp(output, c, uintComp(input, c));
+          else if(data.fmt.compType == CompType::SInt)
+            setIntComp(output, c, intComp(input, c));
+          else
+            setFloatComp(output, c, input.value.f32v[c]);
+        }
+      }
+      else if(data.fmt.compType == CompType::UInt)
+      {
+        RDCASSERT(varComp == CompType::UInt, varComp);
+
+        // set up input type for proper expansion below
+        if(data.fmt.compByteWidth == 1)
+          input.type = VarType::UByte;
+        else if(data.fmt.compByteWidth == 2)
+          input.type = VarType::UShort;
+        else if(data.fmt.compByteWidth == 4)
+          input.type = VarType::UInt;
+        else if(data.fmt.compByteWidth == 8)
+          input.type = VarType::ULong;
+
+        memcpy(input.value.u8v.data(), data.texel(coords, sample), data.texelSize);
+
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
+          setUintComp(output, c, uintComp(input, c));
+      }
       else if(data.fmt.compType == CompType::SInt)
-        input.type = VarType::SInt;
+      {
+        RDCASSERT(varComp == CompType::SInt, varComp);
+
+        // set up input type for proper expansion below
+        if(data.fmt.compByteWidth == 1)
+          input.type = VarType::SByte;
+        else if(data.fmt.compByteWidth == 2)
+          input.type = VarType::SShort;
+        else if(data.fmt.compByteWidth == 4)
+          input.type = VarType::SInt;
+        else if(data.fmt.compByteWidth == 8)
+          input.type = VarType::SLong;
+
+        memcpy(input.value.u8v.data(), data.texel(coords, sample), data.texelSize);
+
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
+          setIntComp(output, c, intComp(input, c));
+      }
       else
+      {
+        RDCASSERT(varComp == CompType::Float, varComp);
+
+        // do the decode of whatever unorm/float/etc the format is
+        FloatVector v = DecodeFormattedComponents(data.fmt, data.texel(coords, sample));
+
+        // set it into f32v
+        input.value.f32v[0] = v.x;
+        input.value.f32v[1] = v.y;
+        input.value.f32v[2] = v.z;
+        input.value.f32v[3] = v.w;
+
+        // read as floats
         input.type = VarType::Float;
 
-      memcpy(input.value.u32v.data(), val.uintValue.data(), val.uintValue.byteSize());
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-      {
-        if(data.fmt.compType == CompType::UInt)
-          setUintComp(output, c, uintComp(input, c));
-        else if(data.fmt.compType == CompType::SInt)
-          setIntComp(output, c, intComp(input, c));
-        else
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
           setFloatComp(output, c, input.value.f32v[c]);
       }
     }
-    else if(data.fmt.compType == CompType::UInt)
-    {
-      RDCASSERT(varComp == CompType::UInt, varComp);
 
-      // set up input type for proper expansion below
-      if(data.fmt.compByteWidth == 1)
-        input.type = VarType::UByte;
-      else if(data.fmt.compByteWidth == 2)
-        input.type = VarType::UShort;
-      else if(data.fmt.compByteWidth == 4)
-        input.type = VarType::UInt;
-      else if(data.fmt.compByteWidth == 8)
-        input.type = VarType::ULong;
-
-      memcpy(input.value.u8v.data(), data.texel(coords, sample), data.texelSize);
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-        setUintComp(output, c, uintComp(input, c));
-    }
-    else if(data.fmt.compType == CompType::SInt)
-    {
-      RDCASSERT(varComp == CompType::SInt, varComp);
-
-      // set up input type for proper expansion below
-      if(data.fmt.compByteWidth == 1)
-        input.type = VarType::SByte;
-      else if(data.fmt.compByteWidth == 2)
-        input.type = VarType::SShort;
-      else if(data.fmt.compByteWidth == 4)
-        input.type = VarType::SInt;
-      else if(data.fmt.compByteWidth == 8)
-        input.type = VarType::SLong;
-
-      memcpy(input.value.u8v.data(), data.texel(coords, sample), data.texelSize);
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-        setIntComp(output, c, intComp(input, c));
-    }
-    else
-    {
-      RDCASSERT(varComp == CompType::Float, varComp);
-
-      // do the decode of whatever unorm/float/etc the format is
-      FloatVector v = DecodeFormattedComponents(data.fmt, data.texel(coords, sample));
-
-      // set it into f32v
-      input.value.f32v[0] = v.x;
-      input.value.f32v[1] = v.y;
-      input.value.f32v[2] = v.z;
-      input.value.f32v[3] = v.w;
-
-      // read as floats
-      input.type = VarType::Float;
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-        setFloatComp(output, c, input.value.f32v[c]);
-    }
-
-    return true;
+    return rdcspv::DeviceOpResult::Succeeded;
   }
 
-  virtual bool WriteTexel(ShaderBindIndex imageBind, const ShaderVariable &coord, uint32_t sample,
-                          const ShaderVariable &input) override
+  // Called from any thread
+  // Caller guarantees that if the image data is not cached then we are on the device thread
+  virtual rdcspv::DeviceOpResult WriteTexel(const ShaderBindIndex &imageBind,
+                                            const ShaderVariable &coord, uint32_t sample,
+                                            const ShaderVariable &input) override
   {
-    ImageData &data = PopulateImage(imageBind);
-
-    if(data.width == 0)
-      return false;
-
-    uint32_t coords[4];
-    for(int i = 0; i < 4; i++)
-      coords[i] = uintComp(coord, i);
-
-    if(coords[0] > data.width || coords[1] > data.height || coords[2] > data.depth)
+    rdcspv::DeviceOpResult opResult;
+    ImageData *result = NULL;
     {
-      m_pDriver->AddDebugMessage(
-          MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
-          StringFormat::Fmt(
-              "Out of bounds access to image, coord %u,%u,%u outside of dimensions %ux%ux%u",
-              coords[0], coords[1], coords[2], data.width, data.height, data.depth));
-      return false;
+      SCOPED_READLOCK(imageCacheLock);
+      result = GetImageDataFromCache(imageBind, opResult);
+      RDCASSERTNOTEQUAL(opResult, rdcspv::DeviceOpResult::NeedsDevice);
     }
 
-    CompType varComp = VarTypeCompType(input.type);
-
-    ShaderVariable output;
-    output.columns = data.fmt.compCount;
-
-    // the only 'irregular' format we need to worry about handling for integer types is 10:10:10:2.
-    // All others are float/uint
-    if(data.fmt.type == ResourceFormatType::R10G10B10A2)
+    if(!result)
     {
-      // image writes are required to write a whole texel so we know we should have 4 components
-      RDCASSERTEQUAL(input.columns, 4);
+      // Add image data to the cache : cache should not be locked by this thread
+      PopulateImage(imageBind);
+    }
 
-      uint32_t encoded = 0;
+    {
+      SCOPED_READLOCK(imageCacheLock);
+      result = GetImageDataFromCache(imageBind, opResult);
+      if(!result)
+        return rdcspv::DeviceOpResult::Failed;
 
-      if(data.fmt.compType == CompType::SNorm)
-        encoded = ConvertToR10G10B10A2SNorm(Vec4f(input.value.f32v[0], input.value.f32v[1],
-                                                  input.value.f32v[2], input.value.f32v[3]));
+      ImageData &data = *result;
+      if(data.width == 0)
+        return rdcspv::DeviceOpResult::Failed;
+
+      uint32_t coords[4];
+      for(int i = 0; i < 4; i++)
+        coords[i] = uintComp(coord, i);
+
+      if(coords[0] >= data.width || coords[1] >= data.height || coords[2] >= data.depth)
+      {
+        if(!IsDeviceThread())
+          return rdcspv::DeviceOpResult::NeedsDevice;
+
+        CHECK_DEVICE_THREAD();
+        m_pDriver->AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt(
+                "Out of bounds access to image, coord %u,%u,%u outside of dimensions %ux%ux%u",
+                coords[0], coords[1], coords[2], data.width, data.height, data.depth));
+        return rdcspv::DeviceOpResult::Failed;
+      }
+
+      CompType varComp = VarTypeCompType(input.type);
+
+      ShaderVariable output;
+      output.columns = data.fmt.compCount;
+
+      // the only 'irregular' format we need to worry about handling for integer types is
+      // 10:10:10:2. All others are float/uint
+      if(data.fmt.type == ResourceFormatType::R10G10B10A2)
+      {
+        // image writes are required to write a whole texel so we know we should have 4 components
+        RDCASSERTEQUAL(input.columns, 4);
+
+        uint32_t encoded = 0;
+
+        if(data.fmt.compType == CompType::SNorm)
+          encoded = ConvertToR10G10B10A2SNorm(Vec4f(input.value.f32v[0], input.value.f32v[1],
+                                                    input.value.f32v[2], input.value.f32v[3]));
+        else if(data.fmt.compType == CompType::UInt)
+          encoded = ConvertToR10G10B10A2(Vec4u(input.value.u32v[0], input.value.u32v[1],
+                                               input.value.u32v[2], input.value.u32v[3]));
+        else
+          encoded = ConvertToR10G10B10A2(Vec4f(input.value.f32v[0], input.value.f32v[1],
+                                               input.value.f32v[2], input.value.f32v[3]));
+
+        memcpy(data.texel(coords, sample), &encoded, sizeof(uint32_t));
+      }
       else if(data.fmt.compType == CompType::UInt)
-        encoded = ConvertToR10G10B10A2(Vec4u(input.value.u32v[0], input.value.u32v[1],
-                                             input.value.u32v[2], input.value.u32v[3]));
+      {
+        RDCASSERT(varComp == CompType::UInt, varComp);
+
+        // set up output type for proper expansion below
+        if(data.fmt.compByteWidth == 1)
+          output.type = VarType::UByte;
+        else if(data.fmt.compByteWidth == 2)
+          output.type = VarType::UShort;
+        else if(data.fmt.compByteWidth == 4)
+          output.type = VarType::UInt;
+        else if(data.fmt.compByteWidth == 8)
+          output.type = VarType::ULong;
+
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
+          setUintComp(output, c, uintComp(input, c));
+
+        memcpy(data.texel(coords, sample), output.value.u8v.data(), data.texelSize);
+      }
+      else if(data.fmt.compType == CompType::SInt)
+      {
+        RDCASSERT(varComp == CompType::SInt, varComp);
+
+        // set up input type for proper expansion below
+        if(data.fmt.compByteWidth == 1)
+          output.type = VarType::SByte;
+        else if(data.fmt.compByteWidth == 2)
+          output.type = VarType::SShort;
+        else if(data.fmt.compByteWidth == 4)
+          output.type = VarType::SInt;
+        else if(data.fmt.compByteWidth == 8)
+          output.type = VarType::SLong;
+
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
+          setIntComp(output, c, intComp(input, c));
+
+        memcpy(data.texel(coords, sample), output.value.u8v.data(), data.texelSize);
+      }
       else
-        encoded = ConvertToR10G10B10A2(Vec4f(input.value.f32v[0], input.value.f32v[1],
-                                             input.value.f32v[2], input.value.f32v[3]));
+      {
+        RDCASSERT(varComp == CompType::Float, varComp);
 
-      memcpy(data.texel(coords, sample), &encoded, sizeof(uint32_t));
+        // read as floats
+        output.type = VarType::Float;
+
+        for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
+          setFloatComp(output, c, input.value.f32v[c]);
+
+        FloatVector v;
+
+        // set it into f32v
+        v.x = input.value.f32v[0];
+        v.y = input.value.f32v[1];
+        v.z = input.value.f32v[2];
+        v.w = input.value.f32v[3];
+
+        EncodeFormattedComponents(data.fmt, v, data.texel(coords, sample));
+      }
     }
-    else if(data.fmt.compType == CompType::UInt)
-    {
-      RDCASSERT(varComp == CompType::UInt, varComp);
-
-      // set up output type for proper expansion below
-      if(data.fmt.compByteWidth == 1)
-        output.type = VarType::UByte;
-      else if(data.fmt.compByteWidth == 2)
-        output.type = VarType::UShort;
-      else if(data.fmt.compByteWidth == 4)
-        output.type = VarType::UInt;
-      else if(data.fmt.compByteWidth == 8)
-        output.type = VarType::ULong;
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-        setUintComp(output, c, uintComp(input, c));
-
-      memcpy(data.texel(coords, sample), output.value.u8v.data(), data.texelSize);
-    }
-    else if(data.fmt.compType == CompType::SInt)
-    {
-      RDCASSERT(varComp == CompType::SInt, varComp);
-
-      // set up input type for proper expansion below
-      if(data.fmt.compByteWidth == 1)
-        output.type = VarType::SByte;
-      else if(data.fmt.compByteWidth == 2)
-        output.type = VarType::SShort;
-      else if(data.fmt.compByteWidth == 4)
-        output.type = VarType::SInt;
-      else if(data.fmt.compByteWidth == 8)
-        output.type = VarType::SLong;
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-        setIntComp(output, c, intComp(input, c));
-
-      memcpy(data.texel(coords, sample), output.value.u8v.data(), data.texelSize);
-    }
-    else
-    {
-      RDCASSERT(varComp == CompType::Float, varComp);
-
-      // read as floats
-      output.type = VarType::Float;
-
-      for(uint8_t c = 0; c < RDCMIN(output.columns, input.columns); c++)
-        setFloatComp(output, c, input.value.f32v[c]);
-
-      FloatVector v;
-
-      // set it into f32v
-      v.x = input.value.f32v[0];
-      v.y = input.value.f32v[1];
-      v.z = input.value.f32v[2];
-      v.w = input.value.f32v[3];
-
-      EncodeFormattedComponents(data.fmt, v, data.texel(coords, sample));
-    }
-
-    return true;
+    return rdcspv::DeviceOpResult::Succeeded;
   }
 
   virtual void FillInputValue(ShaderVariable &var, ShaderBuiltin builtin, uint32_t threadIndex,
                               uint32_t location, uint32_t component) override
   {
+    CHECK_DEVICE_THREAD();
     if(builtin != ShaderBuiltin::Undefined)
     {
       if(threadIndex < thread_builtins.size())
@@ -599,6 +706,7 @@ public:
 
   uint32_t GetThreadProperty(uint32_t threadIndex, rdcspv::ThreadProperty prop) override
   {
+    CHECK_DEVICE_THREAD();
     if(prop >= rdcspv::ThreadProperty::Count)
       return 0;
     if(threadIndex >= thread_props.size())
@@ -607,14 +715,15 @@ public:
     return thread_props[threadIndex][(size_t)prop];
   }
 
-  bool CalculateSampleGather(rdcspv::ThreadState &lane, rdcspv::Op opcode,
-                             DebugAPIWrapper::TextureType texType, ShaderBindIndex imageBind,
-                             ShaderBindIndex samplerBind, const ShaderVariable &uv,
-                             const ShaderVariable &ddxCalc, const ShaderVariable &ddyCalc,
-                             const ShaderVariable &compare, rdcspv::GatherChannel gatherChannel,
-                             const rdcspv::ImageOperandsAndParamDatas &operands,
-                             ShaderVariable &output) override
+  bool QueueSampleGather(rdcspv::ThreadState &lane, rdcspv::Op opcode,
+                         DebugAPIWrapper::TextureType texType, const ShaderBindIndex &imageBind,
+                         const ShaderBindIndex &samplerBind, const ShaderVariable &uv,
+                         const ShaderVariable &ddxCalc, const ShaderVariable &ddyCalc,
+                         const ShaderVariable &compare, rdcspv::GatherChannel gatherChannel,
+                         const rdcspv::ImageOperandsAndParamDatas &operands, ShaderVariable &output,
+                         bool &hasResult) override
   {
+    CHECK_DEVICE_THREAD();
     ShaderConstParameters constParams = {};
     ShaderUniformParameters uniformParams = {};
 
@@ -637,9 +746,12 @@ public:
 
     // if any descriptor lookup failed, return now
     if(!valid)
+    {
+      hasResult = false;
       return false;
+    }
 
-    VkMarkerRegion markerRegion("CalculateSampleGather");
+    VkMarkerRegion markerRegion("QueueSampleGather");
 
     VkBufferView bufferView =
         m_pDriver->GetResourceManager()->GetLiveHandle<VkBufferView>(bufferViewDescriptor.view);
@@ -650,10 +762,33 @@ public:
         m_pDriver->GetResourceManager()->GetLiveHandle<VkImageView>(imageDescriptor.view);
     VkImageLayout layout = convert((DescriptorSlotImageLayout)imageDescriptor.byteOffset);
 
-    // promote view to Array view
+    // NULL view : return 0,0,0,0
+    if(!buffer && (view == VK_NULL_HANDLE))
+    {
+      memset(&output.value, 0, sizeof(output.value));
+      hasResult = true;
+      return true;
+    }
 
-    const VulkanCreationInfo::ImageView &viewProps = m_Creation.m_ImageView[GetResID(view)];
-    const VulkanCreationInfo::Image &imageProps = m_Creation.m_Image[viewProps.image];
+    // promote view to Array view
+    VulkanCreationInfo::ImageView defaultViewProps = {};
+    VulkanCreationInfo::Image defaultImageProps = {};
+    VulkanCreationInfo::Buffer defaultBufferProps = {};
+    VulkanCreationInfo::Sampler defaultSamplerProps = {};
+
+    const VulkanCreationInfo::ImageView &viewProps =
+        buffer ? defaultViewProps : m_Creation.GetImageViewInfo(GetResID(view));
+
+    // NULL image : return 0,0,0,0
+    if(!buffer && (viewProps.image == ResourceId()))
+    {
+      memset(&output.value, 0, sizeof(output.value));
+      hasResult = true;
+      return true;
+    }
+
+    const VulkanCreationInfo::Image &imageProps =
+        buffer ? defaultImageProps : m_Creation.GetImageInfo(viewProps.image);
 
     const bool depthTex = IsDepthOrStencilFormat(viewProps.format);
 
@@ -722,11 +857,13 @@ public:
         output.value.u32v[0] = viewProps.range.levelCount;
         if(viewProps.range.levelCount == VK_REMAINING_MIP_LEVELS)
           output.value.u32v[0] = imageProps.mipLevels - viewProps.range.baseMipLevel;
+        hasResult = true;
         return true;
       }
       case rdcspv::Op::ImageQuerySamples:
       {
         output.value.u32v[0] = (uint32_t)imageProps.samples;
+        hasResult = true;
         return true;
       }
       case rdcspv::Op::ImageQuerySize:
@@ -767,14 +904,17 @@ public:
           else
           {
             const VulkanCreationInfo::BufferView &bufViewProps =
-                m_Creation.m_BufferView[GetResID(bufferView)];
+                m_Creation.GetBufferViewInfo(GetResID(bufferView));
 
             size = bufViewProps.size;
             format = bufViewProps.format;
 
             if(size == VK_WHOLE_SIZE)
             {
-              const VulkanCreationInfo::Buffer &bufProps = m_Creation.m_Buffer[bufViewProps.buffer];
+              const VulkanCreationInfo::Buffer &bufProps =
+                  bufViewProps.buffer == ResourceId()
+                      ? defaultBufferProps
+                      : m_Creation.GetBufferInfo(bufViewProps.buffer);
               size = bufProps.size - bufViewProps.offset;
             }
           }
@@ -782,6 +922,7 @@ public:
           setUintComp(output, 0, uint32_t(size / GetByteSize(1, 1, 1, format, 0)));
         }
 
+        hasResult = true;
         return true;
       }
       default: break;
@@ -840,7 +981,9 @@ public:
         auto insertIt = m_BiasSamplers.insert(std::make_pair(key, VkSampler()));
         if(insertIt.second)
         {
-          const VulkanCreationInfo::Sampler &samplerProps = m_Creation.m_Sampler[key.first];
+          const VulkanCreationInfo::Sampler &samplerProps =
+              (sampler == VK_NULL_HANDLE) ? defaultSamplerProps
+                                          : m_Creation.GetSamplerInfo(key.first);
 
           VkSamplerCreateInfo sampInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
           sampInfo.magFilter = samplerProps.magFilter;
@@ -1203,22 +1346,39 @@ public:
       return false;
     }
 
+    VkCommandBuffer cmd = queuedOpCmdBuffer;
+    if(cmd == VK_NULL_HANDLE)
+    {
+      if(StartQueuedOps())
+        cmd = queuedOpCmdBuffer;
+    }
+    if(cmd == VK_NULL_HANDLE)
+      return false;
+
+    if(queueIndex >= ShaderDebugData::MAX_QUEUED_OPS)
+    {
+      m_pDriver->AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning, "Too many GPU queued operations");
+      return false;
+    }
+
     VkDescriptorImageInfo samplerWriteInfo = {Unwrap(sampler), VK_NULL_HANDLE,
                                               VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo imageWriteInfo = {VK_NULL_HANDLE, Unwrap(sampleView), layout};
 
     VkDescriptorBufferInfo uniformWriteInfo = {};
     m_DebugData.ConstantsBuffer.FillDescriptor(uniformWriteInfo);
+    const VkDescriptorSet realDescSet = Unwrap(m_DebugData.DescSets[queueIndex++]);
 
     VkWriteDescriptorSet writeSets[] = {
         {
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             NULL,
-            Unwrap(m_DebugData.DescSet),
+            realDescSet,
             (uint32_t)ShaderDebugBind::Constants,
             0,
             1,
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
             NULL,
             &uniformWriteInfo,
             NULL,
@@ -1226,7 +1386,7 @@ public:
         {
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             NULL,
-            Unwrap(m_DebugData.DescSet),
+            realDescSet,
             (uint32_t)constParams.dim,
             0,
             1,
@@ -1238,7 +1398,7 @@ public:
         {
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             NULL,
-            Unwrap(m_DebugData.DescSet),
+            realDescSet,
             (uint32_t)ShaderDebugBind::Sampler,
             0,
             1,
@@ -1293,7 +1453,10 @@ public:
       {
         // not all textures may be supported for depth, so only update those that are valid
         if(m_DebugData.DummyWrites[resetIndex][i].descriptorCount != 0)
+        {
+          m_DebugData.DummyWrites[resetIndex][i].dstSet = realDescSet;
           writes.push_back(m_DebugData.DummyWrites[resetIndex][i]);
+        }
       }
 
       ObjDisp(dev)->UpdateDescriptorSets(Unwrap(dev), (uint32_t)writes.count(), writes.data(), 0,
@@ -1307,6 +1470,11 @@ public:
       else if(sintTex)
         resetIndex = 2;
 
+      for(size_t i = 0; i < ARRAY_COUNT(m_DebugData.DummyWrites[resetIndex]); i++)
+      {
+        if(m_DebugData.DummyWrites[resetIndex][i].descriptorCount != 0)
+          m_DebugData.DummyWrites[resetIndex][i].dstSet = realDescSet;
+      }
       ObjDisp(dev)->UpdateDescriptorSets(Unwrap(dev),
                                          ARRAY_COUNT(m_DebugData.DummyWrites[resetIndex]),
                                          m_DebugData.DummyWrites[resetIndex], 0, NULL);
@@ -1316,7 +1484,8 @@ public:
     ObjDisp(dev)->UpdateDescriptorSets(Unwrap(dev), sampler != VK_NULL_HANDLE ? 3 : 2, writeSets, 0,
                                        NULL);
 
-    void *constants = m_DebugData.ConstantsBuffer.Map(NULL, 0);
+    uint32_t constsOffset = 0;
+    void *constants = m_DebugData.ConstantsBuffer.Map(&constsOffset, 0);
     if(!constants)
       return false;
 
@@ -1324,103 +1493,57 @@ public:
 
     m_DebugData.ConstantsBuffer.Unmap();
 
-    {
-      VkCommandBuffer cmd = m_pDriver->GetNextCmd();
+    VkClearValue clear = {};
 
-      if(cmd == VK_NULL_HANDLE)
-        return false;
+    VkRenderPassBeginInfo rpbegin = {
+        VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        NULL,
+        Unwrap(m_DebugData.RenderPass),
+        Unwrap(m_DebugData.Framebuffer),
+        {{0, 0}, {1, 1}},
+        1,
+        &clear,
+    };
+    ObjDisp(cmd)->CmdBeginRenderPass(Unwrap(cmd), &rpbegin, VK_SUBPASS_CONTENTS_INLINE);
 
-      VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
-                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS, Unwrap(pipe));
+    ObjDisp(cmd)->CmdBindDescriptorSets(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        Unwrap(m_DebugData.PipeLayout), 0, 1, &realDescSet, 1,
+                                        &constsOffset);
 
-      VkResult vkr = ObjDisp(cmd)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
-      CHECK_VKR(m_pDriver, vkr);
+    // push uvw/ddx/ddy for the vertex shader
+    ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
+                                   sizeof(Vec4f) * 0, sizeof(Vec4f), &uniformParams.uvwa);
+    ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
+                                   sizeof(Vec4f) * 1, sizeof(Vec3f), &uniformParams.ddx);
+    ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
+                                   sizeof(Vec4f) * 2, sizeof(Vec3f), &uniformParams.ddy);
 
-      VkClearValue clear = {};
+    ObjDisp(cmd)->CmdDraw(Unwrap(cmd), 3, 1, 0, 0);
 
-      VkRenderPassBeginInfo rpbegin = {
-          VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-          NULL,
-          Unwrap(m_DebugData.RenderPass),
-          Unwrap(m_DebugData.Framebuffer),
-          {{0, 0}, {1, 1}},
-          1,
-          &clear,
-      };
-      ObjDisp(cmd)->CmdBeginRenderPass(Unwrap(cmd), &rpbegin, VK_SUBPASS_CONTENTS_INLINE);
+    ObjDisp(cmd)->CmdEndRenderPass(Unwrap(cmd));
 
-      ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS, Unwrap(pipe));
-      ObjDisp(cmd)->CmdBindDescriptorSets(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                          Unwrap(m_DebugData.PipeLayout), 0, 1,
-                                          UnwrapPtr(m_DebugData.DescSet), 0, NULL);
+    RDCASSERT(sampleGatherOpResultOffset + sampleGatherOpResultByteSize <=
+                  m_DebugData.ReadbackBuffer.TotalSize(),
+              sampleGatherOpResultOffset, sampleGatherOpResultByteSize,
+              m_DebugData.ReadbackBuffer.TotalSize());
+    VkBufferImageCopy region = {
+        sampleGatherOpResultOffset,           sizeof(Vec4f), 1,
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},     {1, 1, 1},
+    };
+    sampleGatherOpResultOffset += sampleGatherOpResultByteSize;
+    ObjDisp(cmd)->CmdCopyImageToBuffer(Unwrap(cmd), Unwrap(m_DebugData.Image),
+                                       VK_IMAGE_LAYOUT_GENERAL,
+                                       m_DebugData.ReadbackBuffer.UnwrappedBuffer(), 1, &region);
 
-      // push uvw/ddx/ddy for the vertex shader
-      ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
-                                     sizeof(Vec4f) * 0, sizeof(Vec4f), &uniformParams.uvwa);
-      ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
-                                     sizeof(Vec4f) * 1, sizeof(Vec3f), &uniformParams.ddx);
-      ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
-                                     sizeof(Vec4f) * 2, sizeof(Vec3f), &uniformParams.ddy);
-
-      ObjDisp(cmd)->CmdDraw(Unwrap(cmd), 3, 1, 0, 0);
-
-      ObjDisp(cmd)->CmdEndRenderPass(Unwrap(cmd));
-
-      VkBufferImageCopy region = {
-          0, sizeof(Vec4f), 1, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1},
-      };
-      ObjDisp(cmd)->CmdCopyImageToBuffer(Unwrap(cmd), Unwrap(m_DebugData.Image),
-                                         VK_IMAGE_LAYOUT_GENERAL,
-                                         m_DebugData.ReadbackBuffer.UnwrappedBuffer(), 1, &region);
-
-      VkBufferMemoryBarrier bufBarrier = {
-          VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          NULL,
-          VK_ACCESS_TRANSFER_WRITE_BIT,
-          VK_ACCESS_HOST_READ_BIT,
-          VK_QUEUE_FAMILY_IGNORED,
-          VK_QUEUE_FAMILY_IGNORED,
-          m_DebugData.ReadbackBuffer.UnwrappedBuffer(),
-          0,
-          VK_WHOLE_SIZE,
-      };
-
-      // wait for copy to finish before reading back to host
-      DoPipelineBarrier(cmd, 1, &bufBarrier);
-
-      vkr = ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
-      CHECK_VKR(m_pDriver, vkr);
-
-      m_pDriver->SubmitCmds();
-      m_pDriver->FlushQ();
-    }
-
-    float *retf = (float *)m_DebugData.ReadbackBuffer.Map(NULL, 0);
-    if(!retf)
-      return false;
-
-    uint32_t *retu = (uint32_t *)retf;
-    int32_t *reti = (int32_t *)retf;
-
-    // convert full precision results, we did all sampling at 32-bit precision
-    for(uint8_t c = 0; c < 4; c++)
-    {
-      if(VarTypeCompType(output.type) == CompType::Float)
-        setFloatComp(output, c, retf[c]);
-      else if(VarTypeCompType(output.type) == CompType::SInt)
-        setIntComp(output, c, reti[c]);
-      else
-        setUintComp(output, c, retu[c]);
-    }
-
-    m_DebugData.ReadbackBuffer.Unmap();
-
+    hasResult = false;
     return true;
   }
 
-  virtual bool CalculateMathOp(rdcspv::ThreadState &lane, rdcspv::GLSLstd450 op,
-                               const rdcarray<ShaderVariable> &params, ShaderVariable &output) override
+  virtual bool QueueCalculateMathOp(rdcspv::GLSLstd450 op,
+                                    const rdcarray<ShaderVariable> &params) override
   {
+    CHECK_DEVICE_THREAD();
     RDCASSERT(params.size() <= 3, params.size());
 
     int floatSizeIdx = 0;
@@ -1445,14 +1568,31 @@ public:
       }
     }
 
+    VkCommandBuffer cmd = queuedOpCmdBuffer;
+    if(cmd == VK_NULL_HANDLE)
+    {
+      if(StartQueuedOps())
+        cmd = queuedOpCmdBuffer;
+    }
+    if(cmd == VK_NULL_HANDLE)
+      return false;
+
+    if(queueIndex >= ShaderDebugData::MAX_QUEUED_OPS)
+    {
+      m_pDriver->AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning, "Too many GPU queued operations");
+      return false;
+    }
     VkDescriptorBufferInfo storageWriteInfo = {};
     m_DebugData.MathResult.FillDescriptor(storageWriteInfo);
+
+    const VkDescriptorSet realDescSet = Unwrap(m_DebugData.DescSets[queueIndex++]);
 
     VkWriteDescriptorSet writeSets[] = {
         {
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             NULL,
-            Unwrap(m_DebugData.DescSet),
+            realDescSet,
             (uint32_t)ShaderDebugBind::MathResult,
             0,
             1,
@@ -1467,88 +1607,166 @@ public:
 
     ObjDisp(dev)->UpdateDescriptorSets(Unwrap(dev), 1, writeSets, 0, NULL);
 
+    VkMarkerRegion markerRegion("QueueCalculateMathOp");
+
+    ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  Unwrap(m_DebugData.MathPipe[floatSizeIdx]));
+
+    uint32_t constsOffset = 0;
+    ObjDisp(cmd)->CmdBindDescriptorSets(Unwrap(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        Unwrap(m_DebugData.PipeLayout), 0, 1, &realDescSet, 1,
+                                        &constsOffset);
+
+    // push the parameters
+    for(size_t i = 0; i < params.size(); i++)
     {
-      VkCommandBuffer cmd = m_pDriver->GetNextCmd();
-
-      if(cmd == VK_NULL_HANDLE)
-        return false;
-
-      VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
-                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-
-      VkResult vkr = ObjDisp(cmd)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
-      CHECK_VKR(m_pDriver, vkr);
-
-      ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    Unwrap(m_DebugData.MathPipe[floatSizeIdx]));
-
-      ObjDisp(cmd)->CmdBindDescriptorSets(Unwrap(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          Unwrap(m_DebugData.PipeLayout), 0, 1,
-                                          UnwrapPtr(m_DebugData.DescSet), 0, NULL);
-
-      // push the parameters
-      for(size_t i = 0; i < params.size(); i++)
-      {
-        RDCASSERTEQUAL(params[i].type, params[0].type);
-        double p[4] = {};
-        memcpy(p, params[i].value.f32v.data(), VarTypeByteSize(params[i].type) * params[i].columns);
-        ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout),
-                                       VK_SHADER_STAGE_ALL, uint32_t(sizeof(p) * i), sizeof(p), p);
-      }
-
-      // push the operation afterwards
+      RDCASSERTEQUAL(params[i].type, params[0].type);
+      double p[4] = {};
+      memcpy(p, params[i].value.f32v.data(), VarTypeByteSize(params[i].type) * params[i].columns);
       ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout),
-                                     VK_SHADER_STAGE_ALL, sizeof(Vec4f) * 6, sizeof(uint32_t), &op);
-
-      ObjDisp(cmd)->CmdDispatch(Unwrap(cmd), 1, 1, 1);
-
-      VkBufferMemoryBarrier bufBarrier = {
-          VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          NULL,
-          VK_ACCESS_SHADER_WRITE_BIT,
-          VK_ACCESS_TRANSFER_READ_BIT,
-          VK_QUEUE_FAMILY_IGNORED,
-          VK_QUEUE_FAMILY_IGNORED,
-          m_DebugData.MathResult.UnwrappedBuffer(),
-          0,
-          VK_WHOLE_SIZE,
-      };
-
-      DoPipelineBarrier(cmd, 1, &bufBarrier);
-
-      VkBufferCopy bufCopy = {0, 0, 0};
-      bufCopy.size = sizeof(Vec4f) * 2;
-      ObjDisp(cmd)->CmdCopyBuffer(Unwrap(cmd), m_DebugData.MathResult.UnwrappedBuffer(),
-                                  m_DebugData.ReadbackBuffer.UnwrappedBuffer(), 1, &bufCopy);
-
-      bufBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      bufBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-      bufBarrier.buffer = m_DebugData.ReadbackBuffer.UnwrappedBuffer();
-
-      // wait for copy to finish before reading back to host
-      DoPipelineBarrier(cmd, 1, &bufBarrier);
-
-      vkr = ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
-      CHECK_VKR(m_pDriver, vkr);
-
-      m_pDriver->SubmitCmds();
-      m_pDriver->FlushQ();
+                                     VK_SHADER_STAGE_ALL, uint32_t(sizeof(p) * i), sizeof(p), p);
     }
 
-    byte *ret = (byte *)m_DebugData.ReadbackBuffer.Map(NULL, 0);
-    if(!ret)
-      return false;
+    // push the operation afterwards
+    ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DebugData.PipeLayout), VK_SHADER_STAGE_ALL,
+                                   sizeof(Vec4f) * 6, sizeof(uint32_t), &op);
 
-    // these two operations change the type of the output
-    if(op == rdcspv::GLSLstd450::Length || op == rdcspv::GLSLstd450::Distance)
-      output.columns = 1;
+    ObjDisp(cmd)->CmdDispatch(Unwrap(cmd), 1, 1, 1);
 
-    memcpy(output.value.u32v.data(), ret, VarTypeByteSize(output.type) * output.columns);
+    VkBufferMemoryBarrier bufBarrier = {
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        NULL,
+        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED,
+        m_DebugData.MathResult.UnwrappedBuffer(),
+        0,
+        VK_WHOLE_SIZE,
+    };
 
-    m_DebugData.ReadbackBuffer.Unmap();
+    DoPipelineBarrier(cmd, 1, &bufBarrier);
 
+    RDCASSERT(mathOpResultOffset + mathOpResultByteSize <= m_DebugData.ReadbackBuffer.TotalSize(),
+              mathOpResultOffset, mathOpResultByteSize, m_DebugData.ReadbackBuffer.TotalSize());
+    VkBufferCopy bufCopy = {0, mathOpResultOffset, mathOpResultByteSize};
+    mathOpResultOffset += mathOpResultByteSize;
+    ObjDisp(cmd)->CmdCopyBuffer(Unwrap(cmd), m_DebugData.MathResult.UnwrappedBuffer(),
+                                m_DebugData.ReadbackBuffer.UnwrappedBuffer(), 1, &bufCopy);
     return true;
   }
+
+  bool StartQueuedOps()
+  {
+    CHECK_DEVICE_THREAD();
+
+    RDCASSERTEQUAL(queueIndex, 0);
+    RDCASSERTEQUAL(queuedOpCmdBuffer, VK_NULL_HANDLE);
+    RDCASSERTEQUAL(mathOpResultOffset, 0);
+    RDCASSERTEQUAL(sampleGatherOpResultOffset, 0);
+
+    if(queuedOpCmdBuffer != VK_NULL_HANDLE)
+      return false;
+
+    queuedOpCmdBuffer = m_pDriver->GetNextCmd();
+    if(queuedOpCmdBuffer == VK_NULL_HANDLE)
+      return false;
+
+    VkCommandBuffer cmd = queuedOpCmdBuffer;
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+
+    VkResult vkr = ObjDisp(cmd)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
+    CHECK_VKR(m_pDriver, vkr);
+
+    sampleGatherOpResultOffset = sampleGatherOpResultsStart;
+    return true;
+  }
+
+  virtual bool GetQueuedResults(rdcarray<ShaderVariable *> &mathOpResults,
+                                rdcarray<ShaderVariable *> &sampleGatherResults) override
+  {
+    CHECK_DEVICE_THREAD();
+    if(queuedOpCmdBuffer == VK_NULL_HANDLE)
+      return false;
+
+    VkBufferMemoryBarrier bufBarrier = {
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_HOST_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED,
+        m_DebugData.ReadbackBuffer.UnwrappedBuffer(),
+        0,
+        VK_WHOLE_SIZE,
+    };
+
+    VkCommandBuffer cmd = queuedOpCmdBuffer;
+    if(cmd == VK_NULL_HANDLE)
+      return false;
+
+    // wait for copy to finish before reading back to host
+    DoPipelineBarrier(cmd, 1, &bufBarrier);
+
+    VkResult vkr = ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
+    CHECK_VKR(m_pDriver, vkr);
+
+    m_pDriver->SubmitCmds();
+    m_pDriver->FlushQ();
+
+    queueIndex = 0;
+    queuedOpCmdBuffer = VK_NULL_HANDLE;
+    mathOpResultOffset = 0;
+    sampleGatherOpResultOffset = 0;
+
+    byte *gpuResults = (byte *)m_DebugData.ReadbackBuffer.Map(NULL, 0);
+    if(!gpuResults)
+      return false;
+
+    uintptr_t bufferEnd = (uintptr_t)(gpuResults + m_DebugData.ReadbackBuffer.TotalSize());
+
+    byte *gpuMathOpResults = gpuResults;
+    for(ShaderVariable *result : mathOpResults)
+    {
+      size_t countBytes = VarTypeByteSize(result->type) * result->columns;
+      RDCASSERT((uintptr_t)gpuMathOpResults + countBytes <= bufferEnd, (uintptr_t)gpuMathOpResults,
+                countBytes, bufferEnd);
+      RDCASSERT(countBytes <= mathOpResultByteSize, countBytes, mathOpResultByteSize);
+      memcpy(result->value.u32v.data(), gpuMathOpResults, countBytes);
+      gpuMathOpResults += mathOpResultByteSize;
+    }
+
+    byte *gpuSampleGatherOpResults = gpuResults + sampleGatherOpResultsStart;
+    for(ShaderVariable *result : sampleGatherResults)
+    {
+      float *retf = (float *)gpuSampleGatherOpResults;
+      uint32_t *retu = (uint32_t *)gpuSampleGatherOpResults;
+      int32_t *reti = (int32_t *)gpuSampleGatherOpResults;
+
+      size_t countBytes = 16;
+      RDCASSERT((uintptr_t)gpuSampleGatherOpResults + countBytes <= bufferEnd,
+                (uintptr_t)gpuSampleGatherOpResults, countBytes, bufferEnd);
+      RDCASSERT(countBytes <= sampleGatherOpResultByteSize, countBytes, sampleGatherOpResultByteSize);
+      // convert full precision results, we did all sampling at 32-bit precision
+      ShaderVariable &output = *result;
+      for(uint8_t c = 0; c < 4; c++)
+      {
+        if(VarTypeCompType(output.type) == CompType::Float)
+          setFloatComp(output, c, retf[c]);
+        else if(VarTypeCompType(output.type) == CompType::SInt)
+          setIntComp(output, c, reti[c]);
+        else
+          setUintComp(output, c, retu[c]);
+      }
+      gpuSampleGatherOpResults += sampleGatherOpResultByteSize;
+    }
+
+    m_DebugData.ReadbackBuffer.Unmap();
+    return true;
+  }
+
+  virtual bool QueuedOpsHasSpace() override { return queueIndex < ShaderDebugData::MAX_QUEUED_OPS; }
 
   // global over all threads
   std::unordered_map<ShaderBuiltin, ShaderVariable> global_builtins;
@@ -1561,10 +1779,13 @@ public:
 
   rdcarray<rdcfixedarray<uint32_t, arraydim<rdcspv::ThreadProperty>()>> thread_props;
 
+  uint64_t GetDeviceThreadID() const { return deviceThreadID; }
+  bool IsDeviceThread() const { return Threading::GetCurrentID() == GetDeviceThreadID(); }
+
 private:
   WrappedVulkan *m_pDriver = NULL;
   ShaderDebugData &m_DebugData;
-  VulkanCreationInfo &m_Creation;
+  const VulkanCreationInfo &m_Creation;
 
   bool m_ResourcesDirty = false;
   uint32_t m_EventID;
@@ -1602,7 +1823,17 @@ private:
   typedef rdcpair<ResourceId, float> SamplerBiasKey;
   std::map<SamplerBiasKey, VkSampler> m_BiasSamplers;
 
+  Threading::RWLock bufferCacheLock;
   std::map<ShaderBindIndex, bytebuf> bufferCache;
+
+  VkCommandBuffer queuedOpCmdBuffer = VK_NULL_HANDLE;
+  VkDeviceSize mathOpResultOffset = 0;
+  VkDeviceSize sampleGatherOpResultOffset = 0;
+  uint32_t queueIndex = 0;
+  const VkDeviceSize mathOpResultByteSize = sizeof(Vec4f) * 2;
+  const VkDeviceSize sampleGatherOpResultByteSize = sizeof(Vec4f);
+  const VkDeviceSize sampleGatherOpResultsStart =
+      ShaderDebugData::MAX_QUEUED_OPS * mathOpResultByteSize;
 
   struct ImageData
   {
@@ -1625,10 +1856,12 @@ private:
     }
   };
 
+  Threading::RWLock imageCacheLock;
   std::map<ShaderBindIndex, ImageData> imageCache;
 
-  const Descriptor &GetDescriptor(const rdcstr &access, ShaderBindIndex index, bool &valid)
+  const Descriptor &GetDescriptor(const rdcstr &access, const ShaderBindIndex &index, bool &valid)
   {
+    CHECK_DEVICE_THREAD();
     static Descriptor dummy;
 
     if(index.category == DescriptorCategory::Unknown)
@@ -1657,9 +1890,10 @@ private:
     return m_Descriptors[a];
   }
 
-  const SamplerDescriptor &GetSamplerDescriptor(const rdcstr &access, ShaderBindIndex index,
+  const SamplerDescriptor &GetSamplerDescriptor(const rdcstr &access, const ShaderBindIndex &index,
                                                 bool &valid)
   {
+    CHECK_DEVICE_THREAD();
     static SamplerDescriptor dummy;
 
     if(index.category == DescriptorCategory::Unknown)
@@ -1688,29 +1922,174 @@ private:
     return m_SamplerDescriptors[a];
   }
 
-  bytebuf &PopulateBuffer(uint64_t address, size_t &offs)
+  // Called from any thread
+  ShaderBindIndex GenerateBufferBind(const uint64_t address, size_t &offs)
   {
-    // pick a non-overlapping bind namespace for direct pointer access
+    ResourceId id;
+    uint64_t ptrOffs;
+    m_pDriver->GetResIDFromAddr(address, id, ptrOffs);
+    offs = size_t(ptrOffs);
+
     ShaderBindIndex bind;
+    bind.arrayElement = (address - offs) & 0xFFFFFFFFU;
+
+    return bind;
+  }
+
+  // Called from any thread
+  bool IsBufferCached(const ShaderBindIndex &bind) override
+  {
+    SCOPED_READLOCK(bufferCacheLock);
+    return bufferCache.find(bind) != bufferCache.end();
+  }
+
+  // Called from any thread
+  bool IsBufferCached(uint64_t address) override
+  {
+    size_t offs = 0;
+    ShaderBindIndex bind = GenerateBufferBind(address, offs);
+    return IsBufferCached(bind);
+  }
+
+  // Called from any thread
+  bytebuf *GetBufferDataFromCache(const ShaderBindIndex &bind, rdcspv::DeviceOpResult &opResult)
+  {
+    // Calling function responsible for acquiring bufferCache Read lock
+    auto findIt = bufferCache.find(bind);
+    if(findIt != bufferCache.end())
+    {
+      opResult = rdcspv::DeviceOpResult::Succeeded;
+      return &findIt->second;
+    }
+
+    opResult = rdcspv::DeviceOpResult::Failed;
+
+    // Not in the cache : populate must happen on the device thread
+    if(!IsDeviceThread())
+      opResult = rdcspv::DeviceOpResult::NeedsDevice;
+
+    return NULL;
+  }
+
+  // Called from any thread
+  bool BufferFunction(const ShaderBindIndex &bind, const std::function<void(bytebuf *data)> &func,
+                      rdcspv::DeviceOpResult &opResult)
+  {
+    bool isCached = false;
+    {
+      SCOPED_READLOCK(bufferCacheLock);
+      isCached = GetBufferDataFromCache(bind, opResult) != NULL;
+      if(opResult == rdcspv::DeviceOpResult::NeedsDevice)
+        return false;
+    }
+
+    if(!isCached)
+    {
+      // Add buffer data to the cache : cache should not be locked by this thread
+      PopulateBuffer(bind);
+    }
+
+    {
+      SCOPED_READLOCK(bufferCacheLock);
+      bytebuf *result = GetBufferDataFromCache(bind, opResult);
+      if(result)
+      {
+        // Guarantee the buffer cache readlock whilst the function is called
+        func(result);
+        return true;
+      }
+
+      RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Failed);
+      opResult = rdcspv::DeviceOpResult::Failed;
+      return false;
+    }
+  }
+
+  // Called from any thread
+  bool BufferFunction(uint64_t address, const std::function<void(bytebuf *data, size_t offset)> &func,
+                      rdcspv::DeviceOpResult &opResult)
+  {
+    size_t offs = 0;
+    ShaderBindIndex bind = GenerateBufferBind(address, offs);
+    bool isCached = false;
+    {
+      SCOPED_READLOCK(bufferCacheLock);
+      isCached = GetBufferDataFromCache(bind, opResult) != NULL;
+      if(opResult == rdcspv::DeviceOpResult::NeedsDevice)
+        return false;
+    }
+
+    if(!isCached)
+    {
+      // Add buffer data to the cache : cache should not be locked by this thread
+      PopulateBuffer(address, bind);
+    }
+
+    {
+      SCOPED_READLOCK(bufferCacheLock);
+      bytebuf *result = GetBufferDataFromCache(bind, opResult);
+      if(result)
+      {
+        // Guarantee the buffer cache readlock whilst the function is called
+        func(result, offs);
+        return true;
+      }
+
+      RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Failed);
+      opResult = rdcspv::DeviceOpResult::Failed;
+      return false;
+    }
+  }
+
+  // Must be called from the replay manager thread (the debugger thread)
+  void PopulateBuffer(uint64_t address, ShaderBindIndex bind)
+  {
+    CHECK_DEVICE_THREAD();
+    // pick a non-overlapping bind namespace for direct pointer access
     ResourceId id;
     uint64_t ptrOffs;
 
     m_pDriver->GetResIDFromAddr(address, id, ptrOffs);
     if(id == ResourceId())
     {
-      bind.arrayElement = 0;
-      auto insertIt = bufferCache.insert(std::make_pair(bind, bytebuf()));
+      ShaderBindIndex noBind;
+      CHECK_DEVICE_THREAD();
+      auto insertIt = bufferCache.insert(std::make_pair(noBind, bytebuf()));
       m_pDriver->AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
                                  MessageSource::RuntimeWarning,
                                  StringFormat::Fmt("invalid or OOB pointer access detected ."));
-      return insertIt.first->second;
+      return;
     }
-    bind.arrayElement = (address - offs) & 0xFFFFFFFFU;
-    offs = size_t(ptrOffs);
 
-    auto insertIt = bufferCache.insert(std::make_pair(bind, bytebuf()));
-    bytebuf &data = insertIt.first->second;
-    if(insertIt.second)
+    // if the resources might be dirty from side-effects from the action, replay back to right
+    // before it.
+    if(m_ResourcesDirty)
+    {
+      VkMarkerRegion region("un-dirtying resources");
+      m_pDriver->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
+      m_ResourcesDirty = false;
+    }
+
+    bytebuf data;
+    m_pDriver->GetDebugManager()->GetBufferData(id, 0, 0, data);
+
+    {
+      // Insert atomically with all the data filled in : to prevent race conditions
+      SCOPED_WRITELOCK(bufferCacheLock);
+      auto insertIt = bufferCache.insert(std::make_pair(bind, data));
+      RDCASSERT(insertIt.second);
+    }
+  }
+
+  // Must be called from the replay manager thread (the debugger thread)
+  void PopulateBuffer(const ShaderBindIndex &bind)
+  {
+    CHECK_DEVICE_THREAD();
+    bytebuf data;
+
+    bool valid = true;
+    const Descriptor &bufData = GetDescriptor("accessing buffer value", bind, valid);
+    if(valid)
     {
       // if the resources might be dirty from side-effects from the action, replay back to right
       // before it.
@@ -1720,112 +2099,97 @@ private:
         m_pDriver->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
         m_ResourcesDirty = false;
       }
-      m_pDriver->GetDebugManager()->GetBufferData(id, 0, 0, data);
-    }
-    return data;
-  }
 
-  bytebuf &PopulateBuffer(ShaderBindIndex bind)
-  {
-    auto insertIt = bufferCache.insert(std::make_pair(bind, bytebuf()));
-    bytebuf &data = insertIt.first->second;
-    if(insertIt.second)
-    {
-      bool valid = true;
-      const Descriptor &bufData = GetDescriptor("accessing buffer value", bind, valid);
-      if(valid)
+      if(bufData.resource != ResourceId())
       {
-        // if the resources might be dirty from side-effects from the action, replay back to right
-        // before it.
-        if(m_ResourcesDirty)
-        {
-          VkMarkerRegion region("un-dirtying resources");
-          m_pDriver->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
-          m_ResourcesDirty = false;
-        }
-
-        if(bufData.resource != ResourceId())
-        {
-          m_pDriver->GetReplay()->GetBufferData(
-              m_pDriver->GetResourceManager()->GetLiveID(bufData.resource), bufData.byteOffset,
-              bufData.byteSize, data);
-        }
+        m_pDriver->GetReplay()->GetBufferData(
+            m_pDriver->GetResourceManager()->GetLiveID(bufData.resource), bufData.byteOffset,
+            bufData.byteSize, data);
       }
     }
 
-    return data;
+    {
+      // Insert atomically with all the data filled in : to prevent race conditions
+      SCOPED_WRITELOCK(bufferCacheLock);
+      auto insertIt = bufferCache.insert(std::make_pair(bind, data));
+      RDCASSERT(insertIt.second);
+    }
   }
 
-  ImageData &PopulateImage(ShaderBindIndex bind)
+  // Must be called from the replay manager thread (the debugger thread)
+  void PopulateImage(const ShaderBindIndex &bind)
   {
-    auto insertIt = imageCache.insert(std::make_pair(bind, ImageData()));
-    ImageData &data = insertIt.first->second;
-    if(insertIt.second)
+    CHECK_DEVICE_THREAD();
+
+    ImageData data;
+    bool valid = true;
+    const Descriptor &imgData = GetDescriptor("performing image load/store", bind, valid);
+    if(valid)
     {
-      bool valid = true;
-      const Descriptor &imgData = GetDescriptor("performing image load/store", bind, valid);
-      if(valid)
+      // if the resources might be dirty from side-effects from the action, replay back to right
+      // before it.
+      if(m_ResourcesDirty)
       {
-        // if the resources might be dirty from side-effects from the action, replay back to right
-        // before it.
-        if(m_ResourcesDirty)
+        VkMarkerRegion region("un-dirtying resources");
+        m_pDriver->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
+        m_ResourcesDirty = false;
+      }
+
+      if(imgData.type == DescriptorType::TypedBuffer ||
+         imgData.type == DescriptorType::ReadWriteTypedBuffer)
+      {
+        VkFormat format;
+        VkDeviceSize byteWidth;
+        VkDeviceSize offset;
+        ResourceId buffer;
+
+        if(imgData.view == ResourceId())
         {
-          VkMarkerRegion region("un-dirtying resources");
-          m_pDriver->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
-          m_ResourcesDirty = false;
+          // descriptor buffer, no buffer view
+          buffer = m_pDriver->GetResourceManager()->GetLiveID(imgData.resource);
+          offset = imgData.byteOffset;
+          format = MakeVkFormat(imgData.format);
+          byteWidth = imgData.byteSize;
+        }
+        else
+        {
+          const VulkanCreationInfo::BufferView &viewProps =
+              m_Creation.GetBufferViewInfo(m_pDriver->GetResourceManager()->GetLiveID(imgData.view));
+          buffer = viewProps.buffer;
+          offset = viewProps.offset;
+          format = viewProps.format;
+          byteWidth = viewProps.size;
         }
 
-        if(imgData.type == DescriptorType::TypedBuffer ||
-           imgData.type == DescriptorType::ReadWriteTypedBuffer)
+        VulkanCreationInfo::Buffer defaultBufferProps = {};
+        const VulkanCreationInfo::Buffer &bufferProps =
+            (buffer == ResourceId()) ? defaultBufferProps : m_Creation.GetBufferInfo(buffer);
+
+        // width in bytes, either from the view or from the remainder of the buffer
+        if(byteWidth == VK_WHOLE_SIZE)
+          byteWidth = bufferProps.size - offset;
+
+        data.fmt = MakeResourceFormat(format);
+        data.texelSize = (uint32_t)GetByteSize(1, 1, 1, format, 0);
+
+        // convert to a texel width, rounding down as per spec (only possible from VK_WHOLE_SIZE)
+        data.width = uint32_t(byteWidth / data.texelSize);
+        data.height = 1;
+        data.depth = 1;
+
+        data.samplePitch = data.slicePitch = data.rowPitch = data.width * data.texelSize;
+
+        m_pDriver->GetReplay()->GetBufferData(
+            m_pDriver->GetResourceManager()->GetLiveID(imgData.resource), offset, data.rowPitch,
+            data.bytes);
+      }
+      else if(imgData.view != ResourceId())
+      {
+        const VulkanCreationInfo::ImageView &viewProps =
+            m_Creation.GetImageViewInfo(m_pDriver->GetResourceManager()->GetLiveID(imgData.view));
+        if(viewProps.image != ResourceId())
         {
-          VkFormat format;
-          VkDeviceSize byteWidth;
-          VkDeviceSize offset;
-          ResourceId buffer;
-
-          if(imgData.view == ResourceId())
-          {
-            // descriptor buffer, no buffer view
-            buffer = imgData.resource;
-            offset = imgData.byteOffset;
-            format = MakeVkFormat(imgData.format);
-            byteWidth = imgData.byteSize;
-          }
-          else
-          {
-            const VulkanCreationInfo::BufferView &viewProps =
-                m_Creation.m_BufferView[m_pDriver->GetResourceManager()->GetLiveID(imgData.view)];
-            buffer = viewProps.buffer;
-            offset = viewProps.offset;
-            format = viewProps.format;
-            byteWidth = viewProps.size;
-          }
-
-          const VulkanCreationInfo::Buffer &bufferProps = m_Creation.m_Buffer[buffer];
-
-          // width in bytes, either from the view or from the remainder of the buffer
-          if(byteWidth == VK_WHOLE_SIZE)
-            byteWidth = bufferProps.size - offset;
-
-          data.fmt = MakeResourceFormat(format);
-          data.texelSize = (uint32_t)GetByteSize(1, 1, 1, format, 0);
-
-          // convert to a texel width, rounding down as per spec (only possible from VK_WHOLE_SIZE)
-          data.width = uint32_t(byteWidth / data.texelSize);
-          data.height = 1;
-          data.depth = 1;
-
-          data.samplePitch = data.slicePitch = data.rowPitch = data.width * data.texelSize;
-
-          m_pDriver->GetReplay()->GetBufferData(
-              m_pDriver->GetResourceManager()->GetLiveID(imgData.resource), offset, data.rowPitch,
-              data.bytes);
-        }
-        else if(imgData.view != ResourceId())
-        {
-          const VulkanCreationInfo::ImageView &viewProps =
-              m_Creation.m_ImageView[m_pDriver->GetResourceManager()->GetLiveID(imgData.view)];
-          const VulkanCreationInfo::Image &imageProps = m_Creation.m_Image[viewProps.image];
+          const VulkanCreationInfo::Image &imageProps = m_Creation.GetImageInfo(viewProps.image);
 
           uint32_t mip = viewProps.range.baseMipLevel;
 
@@ -1881,12 +2245,45 @@ private:
       }
     }
 
-    return data;
+    {
+      // Insert atomically with all the data filled in : to prevent race conditions
+      SCOPED_WRITELOCK(imageCacheLock);
+      auto insertIt = imageCache.insert(std::make_pair(bind, data));
+      RDCASSERT(insertIt.second);
+    }
+  }
+
+  // Called from any thread
+  bool IsImageCached(const ShaderBindIndex &bind) override
+  {
+    SCOPED_READLOCK(imageCacheLock);
+    return imageCache.find(bind) != imageCache.end();
+  }
+
+  // Called from any thread
+  ImageData *GetImageDataFromCache(const ShaderBindIndex &bind, rdcspv::DeviceOpResult &opResult)
+  {
+    // Calling function responsible for acquiring imageCache Read lock
+    auto findIt = imageCache.find(bind);
+    if(findIt != imageCache.end())
+    {
+      opResult = rdcspv::DeviceOpResult::Succeeded;
+      return &findIt->second;
+    }
+
+    opResult = rdcspv::DeviceOpResult::Failed;
+
+    // Not in the cache : populate must happen on the device thread
+    if(!IsDeviceThread())
+      opResult = rdcspv::DeviceOpResult::NeedsDevice;
+
+    return NULL;
   }
 
   VkPipeline MakePipe(const ShaderConstParameters &params, uint32_t floatBitSize, bool depthTex,
                       bool uintTex, bool sintTex)
   {
+    CHECK_DEVICE_THREAD();
     VkSpecializationMapEntry specMaps[sizeof(params) / sizeof(uint32_t)];
     for(size_t i = 0; i < ARRAY_COUNT(specMaps); i++)
     {
@@ -2094,6 +2491,7 @@ private:
 
   void GenerateMathShaderModule(rdcarray<uint32_t> &spirv, uint32_t floatBitSize)
   {
+    CHECK_DEVICE_THREAD();
     rdcspv::Editor editor(spirv);
 
     // create as SPIR-V 1.0 for best compatibility
@@ -2343,6 +2741,7 @@ private:
   void GenerateSamplingShaderModule(rdcarray<uint32_t> &spirv, bool depthTex, bool uintTex,
                                     bool sintTex)
   {
+    CHECK_DEVICE_THREAD();
     // this could be done as a glsl shader, but glslang has some bugs compiling the specialisation
     // constants, so we generate it by hand - which isn't too hard
 
@@ -3055,6 +3454,8 @@ private:
 
     editor.AddFunction(func);
   }
+
+  const uint64_t deviceThreadID;
 };
 
 enum class InputSpecConstant
@@ -5585,8 +5986,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
     ResourceId rp = state.GetRenderPass();
     if(rp != ResourceId())
     {
-      const VulkanCreationInfo::RenderPass &rpInfo =
-          m_pDriver->GetDebugManager()->GetRenderPassInfo(rp);
+      const VulkanCreationInfo::RenderPass &rpInfo = GetDebugManager()->GetRenderPassInfo(rp);
       for(auto it = rpInfo.subpasses.begin(); it != rpInfo.subpasses.end(); ++it)
       {
         if(it->multiviews.isEmpty())
@@ -6071,10 +6471,7 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
     numThreads = RDCMAX(numThreads, maxSubgroupSize);
   if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup)
-  {
-    if(Vulkan_Hack_EnableGroupCaps())
-      numThreads = RDCMAX(numThreads, threadDim[0] * threadDim[1] * threadDim[2]);
-  }
+    numThreads = RDCMAX(numThreads, threadDim[0] * threadDim[1] * threadDim[2]);
 
   apiWrapper->thread_builtins.resize(numThreads);
   apiWrapper->thread_props.resize(numThreads);
@@ -6496,7 +6893,7 @@ rdcarray<ShaderDebugState> VulkanReplay::ContinueDebug(ShaderDebugger *debugger)
       m_ShaderDebugData.DummyWrites[fmt][dim].descriptorCount = 1;
       m_ShaderDebugData.DummyWrites[fmt][dim].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       m_ShaderDebugData.DummyWrites[fmt][dim].dstBinding = uint32_t(dim + 1);
-      m_ShaderDebugData.DummyWrites[fmt][dim].dstSet = Unwrap(m_ShaderDebugData.DescSet);
+      m_ShaderDebugData.DummyWrites[fmt][dim].dstSet = VK_NULL_HANDLE;
       m_ShaderDebugData.DummyWrites[fmt][dim].pImageInfo =
           &m_ShaderDebugData.DummyImageInfos[fmt][dim];
     }
@@ -6507,7 +6904,7 @@ rdcarray<ShaderDebugState> VulkanReplay::ContinueDebug(ShaderDebugger *debugger)
     m_ShaderDebugData.DummyWrites[fmt][5].descriptorCount = 1;
     m_ShaderDebugData.DummyWrites[fmt][5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     m_ShaderDebugData.DummyWrites[fmt][5].dstBinding = (uint32_t)ShaderDebugBind::Sampler;
-    m_ShaderDebugData.DummyWrites[fmt][5].dstSet = Unwrap(m_ShaderDebugData.DescSet);
+    m_ShaderDebugData.DummyWrites[fmt][5].dstSet = VK_NULL_HANDLE;
     m_ShaderDebugData.DummyWrites[fmt][5].pImageInfo = &m_ShaderDebugData.DummyImageInfos[fmt][5];
 
     if(m_TexRender.DummyBufferView[fmt] != VK_NULL_HANDLE)
@@ -6516,7 +6913,7 @@ rdcarray<ShaderDebugState> VulkanReplay::ContinueDebug(ShaderDebugger *debugger)
       m_ShaderDebugData.DummyWrites[fmt][6].descriptorCount = 1;
       m_ShaderDebugData.DummyWrites[fmt][6].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
       m_ShaderDebugData.DummyWrites[fmt][6].dstBinding = (uint32_t)ShaderDebugBind::Buffer;
-      m_ShaderDebugData.DummyWrites[fmt][6].dstSet = Unwrap(m_ShaderDebugData.DescSet);
+      m_ShaderDebugData.DummyWrites[fmt][6].dstSet = VK_NULL_HANDLE;
       m_ShaderDebugData.DummyWrites[fmt][6].pTexelBufferView =
           UnwrapPtr(m_TexRender.DummyBufferView[fmt]);
     }
@@ -6533,4 +6930,5 @@ rdcarray<ShaderDebugState> VulkanReplay::ContinueDebug(ShaderDebugger *debugger)
 void VulkanReplay::FreeDebugger(ShaderDebugger *debugger)
 {
   delete debugger;
+  Threading::JobSystem::SyncAllJobs();
 }

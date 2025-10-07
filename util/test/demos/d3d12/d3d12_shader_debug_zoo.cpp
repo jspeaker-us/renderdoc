@@ -224,6 +224,7 @@ float4 main(v2f IN) : SV_Target0
   float tiny = IN.tinyVal;
 
   int intval = IN.intval;
+  int pixId = IN.s.x + 3 * IN.s.y;
 
   if(IN.tri == 0)
     return float4(log(negone), log(zero), log(posone), 1.0f);
@@ -798,7 +799,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 10;
+    intbufrwtest[u] = 10 + pixId;
     InterlockedAdd(intbufrwtest[u], value, original);
     InterlockedAdd(intbufrwtest[u], -value, original);
     return intbufrwtest[u];
@@ -808,7 +809,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 20;
+    intbufrwtest[u] = 20 + pixId;
     InterlockedAnd(intbufrwtest[u], value, original);
     return intbufrwtest[u];
   }
@@ -817,7 +818,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 30;
+    intbufrwtest[u] = 30 + pixId;
     InterlockedOr(intbufrwtest[u], value, original);
     return intbufrwtest[u];
   }
@@ -826,7 +827,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 40;
+    intbufrwtest[u] = 40 + pixId;
     InterlockedXor(intbufrwtest[u], value, original);
     InterlockedXor(intbufrwtest[u], value, original);
     return intbufrwtest[u];
@@ -836,7 +837,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 50;
+    intbufrwtest[u] = 50 + pixId;
     InterlockedMin(intbufrwtest[u], value, original);
     return intbufrwtest[u];
   }
@@ -845,7 +846,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 60;
+    intbufrwtest[u] = 60 + pixId;
     InterlockedMax(intbufrwtest[u], value, original);
     return intbufrwtest[u];
   }
@@ -854,7 +855,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 70;
+    intbufrwtest[u] = 70 + pixId;
     InterlockedExchange(intbufrwtest[u], value, original);
     return intbufrwtest[u];
   }
@@ -863,7 +864,7 @@ float4 main(v2f IN) : SV_Target0
     int value = IN.tri;
     int original;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 80;
+    intbufrwtest[u] = 80 + pixId;
     InterlockedCompareExchange(intbufrwtest[u], value, value+1, original);
     return intbufrwtest[u];
   }
@@ -871,7 +872,7 @@ float4 main(v2f IN) : SV_Target0
   {
     int value = IN.tri;
     int u = mad(3, (IN.tri - 85), 17);
-    intbufrwtest[u] = 90;
+    intbufrwtest[u] = 90 + pixId;
     InterlockedCompareStore(intbufrwtest[u], value, value+1);
     return intbufrwtest[u];
   }
@@ -1000,7 +1001,7 @@ float4 main(v2f IN) : SV_Target0
     // idx = 0
     int idx = intval - IN.tri - 7;
     int prev = gInt;
-    gInt += (idx+1);
+    gInt += (idx+1) + IN.s.x + IN.s.y;
     gIntArray[idx] = gInt;
     return float4(prev, gInt, gIntArray[idx], gIntArray[idx+1]);
   }
@@ -1104,6 +1105,12 @@ cbuffer consts : register(b0)
   double doubleX;
 };
 
+cbuffer packed_consts : register(b1)
+{
+  uint col1z : packoffset(c1.z);
+  uint col2w : packoffset(c2.w);
+};
+
 RWStructuredBuffer<uint4> bufIn : register(u0);
 RWStructuredBuffer<uint4> bufOut : register(u1);
 
@@ -1151,6 +1158,12 @@ void main(int3 inTestIndex : SV_GroupID)
     testResult.y = testIndex;
     testResult.z = gsmStruct[gsmInt * 4].a.y;
     testResult.w = gsmInt2DArray[ZERO][idx] + gsmInt2DArray[ONE][idx];
+  }
+  else if (testIndex == 2)
+  {
+    testResult = bufOut[0];
+    testResult.x += bufIn[0].x * (uint)col1z;
+    testResult.y += bufIn[0].y * (uint)col2w;
   }
   else
   {
@@ -1890,6 +1903,7 @@ void main(int3 inTestIndex : SV_GroupID)
         uavParam(D3D12_SHADER_VISIBILITY_ALL, 0, 0),
         uavParam(D3D12_SHADER_VISIBILITY_ALL, 0, 1),
         constParam(D3D12_SHADER_VISIBILITY_ALL, 0, 0, 4),
+        constParam(D3D12_SHADER_VISIBILITY_ALL, 0, 1, 12),
         tableParam(D3D12_SHADER_VISIBILITY_ALL, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 2, 1, 3),
     });
 
@@ -2123,7 +2137,9 @@ void main(int3 inTestIndex : SV_GroupID)
         cmd->SetComputeRoot32BitConstant(2, 6, 1);
         cmd->SetComputeRoot32BitConstant(2, 7, 2);
         cmd->SetComputeRoot32BitConstant(2, 8, 3);
-        cmd->SetComputeRootDescriptorTable(3, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
+        cmd->SetComputeRoot32BitConstant(3, 10, 4 + 2);    // col1z
+        cmd->SetComputeRoot32BitConstant(3, 11, 8 + 3);    // col2w
+        cmd->SetComputeRootDescriptorTable(4, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
 
         cmd->SetPipelineState(computePSOs[i]);
         setMarker(cmd, computeSMs[i]);

@@ -94,7 +94,7 @@ RDResult VulkanReplay::FatalErrorCheck()
 IReplayDriver *VulkanReplay::MakeDummyDriver()
 {
   // gather up the shaders we've allocated to pass to the dummy driver
-  rdcarray<ShaderReflection *> shaders;
+  rdcarray<const ShaderReflection *> shaders;
   for(auto it = m_pDriver->m_CreationInfo.m_ShaderModule.begin();
       it != m_pDriver->m_CreationInfo.m_ShaderModule.end(); it++)
   {
@@ -440,8 +440,8 @@ rdcarray<ShaderEntryPoint> VulkanReplay::GetShaderEntryPoints(ResourceId shader)
   return shad->second.spirv.EntryPoints();
 }
 
-ShaderReflection *VulkanReplay::GetShader(ResourceId pipeline, ResourceId shader,
-                                          ShaderEntryPoint entry)
+const ShaderReflection *VulkanReplay::GetShader(ResourceId pipeline, ResourceId shader,
+                                                ShaderEntryPoint entry)
 {
   auto shad = m_pDriver->m_CreationInfo.m_ShaderModule.find(shader);
 
@@ -2973,6 +2973,10 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
             access.descriptorStore = rm->GetOriginalID(
                 m_pDriver->m_CreationInfo.m_PipelineLayout[bufSet.pipeLayout].descSetLayouts[i]);
             access.byteOffset = 0;
+          }
+          else if(bufSet.descBufferIdx >= state.descBufs.size())
+          {
+            access.descriptorStore = ResourceId();
           }
           else
           {
