@@ -1,0 +1,42 @@
+; ============================================================================
+; RenderDoc Injector 配置文件示例
+; ============================================================================
+; 注意：当前版本的注入器使用命令行参数，暂不读取此配置文件
+; 此文件仅供参考，展示未来可能的配置选项
+; ============================================================================
+
+[Game]
+; 游戏可执行文件路径
+ExecutablePath=C:\Games\MyGame\MyGame.exe
+
+; 游戏命令行参数
+Arguments=-windowed -debug
+
+; 工作目录（留空则使用游戏所在目录）
+WorkingDirectory=
+
+[RenderDoc]
+; RenderDoc DLL路径（留空则自动查找）
+DllPath=
+
+; 是否在注入后等待游戏退出
+WaitForExit=false
+
+; 日志级别 (0=Error, 1=Warning, 2=Info, 3=Debug)
+LogLevel=2
+
+[Capture]
+; 自动捕获第N帧（0=禁用）
+AutoCaptureFrame=0
+
+; 捕获帧数
+CaptureFrameCount=1
+
+; 捕获保存路径（留空则使用默认临时目录）
+CapturePath=
+
+[Hotkeys]
+; 自定义快捷键（暂未实现）
+; CaptureFrame=F12
+; CycleWindow=F11
+
