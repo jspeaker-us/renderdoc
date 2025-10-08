@@ -3,12 +3,20 @@
  * 
  * 功能：
  * 1. 创建游戏进程（挂起状态）
- * 2. 在游戏初始化前注入renderdoc.dll
+ * 2. 在游戏初始化前注入 RenderDoc DLL
  * 3. 恢复游戏进程执行
  * 
  * 使用方法：
  *   RenderDocInjector.exe <游戏路径> [参数]
  *   RenderDocInjector.exe "C:\Games\MyGame.exe" -windowed
+ * 
+ * 配置 DLL 名称：
+ *   修改下面的 DLL_NAME 宏来更改要注入的 DLL 名称
+ * 
+ *   示例：
+ *     #define DLL_NAME L"rdx.dll"         // 使用 rdx.dll
+ *     #define DLL_NAME L"custom.dll"      // 使用自定义名称
+ *     #define DLL_NAME L"renderdoc.dll"   // 使用原始名称
  ******************************************************************************/
 
 #include <windows.h>
@@ -20,6 +28,10 @@
 // 配置
 // ============================================================================
 #define LOG_FILE "renderdoc_injector.log"
+
+// DLL 名称配置（可修改以使用不同的名称）
+// 修改这里来改变要注入的 DLL 名称
+#define DLL_NAME L"rdxx.dll"
 
 // ============================================================================
 // 日志函数
@@ -59,14 +71,17 @@ void LogW(const wchar_t* format, ...) {
 }
 
 // ============================================================================
-// 查找RenderDoc DLL
+// 查找RenderDoc DLL (使用宏定义的名称)
 // ============================================================================
 bool FindRenderDocDLL(wchar_t* outPath, size_t maxLen) {
+    Log("Searching for DLL: %S", DLL_NAME);
+    
     // 1. 尝试当前目录
-    if (GetFileAttributesW(L"renderdoc.dll") != INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesW(DLL_NAME) != INVALID_FILE_ATTRIBUTES) {
         wchar_t currentDir[MAX_PATH];
         GetCurrentDirectoryW(MAX_PATH, currentDir);
-        swprintf(outPath, maxLen, L"%s\\renderdoc.dll", currentDir);
+        swprintf(outPath, maxLen, L"%s\\%s", currentDir, DLL_NAME);
+        Log("Found in current directory");
         return true;
     }
     
@@ -76,8 +91,9 @@ bool FindRenderDocDLL(wchar_t* outPath, size_t maxLen) {
     wchar_t* lastSlash = wcsrchr(exePath, L'\\');
     if (lastSlash) {
         *lastSlash = L'\0';
-        swprintf(outPath, maxLen, L"%s\\renderdoc.dll", exePath);
+        swprintf(outPath, maxLen, L"%s\\%s", exePath, DLL_NAME);
         if (GetFileAttributesW(outPath) != INVALID_FILE_ATTRIBUTES) {
+            Log("Found in injector directory");
             return true;
         }
     }
@@ -91,12 +107,13 @@ bool FindRenderDocDLL(wchar_t* outPath, size_t maxLen) {
         if (RegQueryValueExW(key, NULL, NULL, &type, (LPBYTE)outPath, &size) == ERROR_SUCCESS) {
             RegCloseKey(key);
             
-            // 提取目录并添加renderdoc.dll
+            // 提取目录并添加 DLL 名称
             wchar_t* slash = wcsrchr(outPath, L'\\');
             if (slash) {
                 *(slash + 1) = L'\0';
-                wcscat(outPath, L"renderdoc.dll");
+                wcscat(outPath, DLL_NAME);
                 if (GetFileAttributesW(outPath) != INVALID_FILE_ATTRIBUTES) {
+                    Log("Found in RenderDoc installation directory");
                     return true;
                 }
             }
@@ -107,8 +124,9 @@ bool FindRenderDocDLL(wchar_t* outPath, size_t maxLen) {
     // 4. 尝试环境变量
     wchar_t envPath[MAX_PATH];
     if (GetEnvironmentVariableW(L"RENDERDOC_PATH", envPath, MAX_PATH) > 0) {
-        swprintf(outPath, maxLen, L"%s\\renderdoc.dll", envPath);
+        swprintf(outPath, maxLen, L"%s\\%s", envPath, DLL_NAME);
         if (GetFileAttributesW(outPath) != INVALID_FILE_ATTRIBUTES) {
+            Log("Found via RENDERDOC_PATH environment variable");
             return true;
         }
     }
@@ -311,8 +329,8 @@ int wmain(int argc, wchar_t* argv[]) {
     // 4. 查找RenderDoc DLL
     wchar_t dllPath[MAX_PATH];
     if (!FindRenderDocDLL(dllPath, MAX_PATH)) {
-        wprintf(L"ERROR: Cannot find renderdoc.dll\n");
-        wprintf(L"\nPlease ensure renderdoc.dll is in one of these locations:\n");
+        wprintf(L"ERROR: Cannot find %s\n\n", DLL_NAME);
+        wprintf(L"Please ensure the DLL is in one of these locations:\n");
         wprintf(L"  1. Current directory\n");
         wprintf(L"  2. Same directory as RenderDocInjector.exe\n");
         wprintf(L"  3. RenderDoc installation directory\n");
@@ -320,7 +338,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
     
-    LogW(L"Found renderdoc.dll at: %s", dllPath);
+    LogW(L"Found RenderDoc DLL at: %s", dllPath);
     
     // 5. 验证文件存在
     if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) {

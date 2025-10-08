@@ -1,18 +1,12 @@
-Found renderdoc.dll at: D:\win\AInvertProject\renderdocx\x64\Development\renderdoc.dll
-Creating process: D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands\Into The Emberlands.exe
-Command line: "D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands\Into The Emberlands.exe"
-Working directory: D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands
-Process created successfully (PID: 18732)
+Searching for DLL: rdxx.dll
+Found in injector directory
+Found RenderDoc DLL at: D:\win\AInvertProject\renderdocx\x64\Development\rdxx.dll
+Creating process: D:\Program Files\EndField Launcher\EndField Game\Endfield_TBeta_OS.exe
+Command line: "D:\Program Files\EndField Launcher\EndField Game\Endfield_TBeta_OS.exe"
+Working directory: D:\Program Files\EndField Launcher\EndField Game
+Process created successfully (PID: 20684)
 Process is suspended, injecting DLL...
-Injecting DLL: D:\win\AInvertProject\renderdocx\x64\Development\renderdoc.dll
+Injecting DLL: D:\win\AInvertProject\renderdocx\x64\Development\rdxx.dll
 Remote thread created, waiting for completion...
-DLL injected successfully! Module handle: 0x00000000E4030000
-Resuming process...
-========================================
-SUCCESS!
-Game launched with RenderDoc injected!
-========================================
-Hotkeys:
-  F11        - Cycle active window
-  F12/PrtScr - Capture frame
-========================================
+LoadLibraryW failed in target process
+Failed to inject DLL, terminating process...
