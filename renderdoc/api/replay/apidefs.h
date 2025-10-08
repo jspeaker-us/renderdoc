@@ -77,7 +77,8 @@
 
 #if defined(RENDERDOC_PLATFORM_WIN32)
 
-#define RENDERDOC_EXPORT_API __declspec(dllexport)
+// Modified to control exports via .def file only
+#define RENDERDOC_EXPORT_API
 #define RENDERDOC_IMPORT_API __declspec(dllimport)
 #define RENDERDOC_CC __cdecl
 

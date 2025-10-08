@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.13.35919.96 d17.13
+VisualStudioVersion = 17.13.35919.96
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "UI", "UI", "{89059266-9C4E-4637-AB1D-BFF1DC15096B}"
 EndProject
@@ -92,7 +92,6 @@ Global
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}.Development|x64.ActiveCfg = Development|x64
-		{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}.Development|x64.Build.0 = Development|x64
 		{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}.Development|x86.ActiveCfg = Development|Win32
 		{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}.Development|x86.Build.0 = Development|Win32
 		{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}.Release|x64.ActiveCfg = Release|x64
@@ -108,7 +107,6 @@ Global
 		{E2B46D67-90E2-40B6-9597-72930E7845E5}.Release|x86.ActiveCfg = Release|Win32
 		{E2B46D67-90E2-40B6-9597-72930E7845E5}.Release|x86.Build.0 = Release|Win32
 		{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}.Development|x64.ActiveCfg = Development|x64
-		{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}.Development|x64.Build.0 = Development|x64
 		{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}.Development|x86.ActiveCfg = Development|Win32
 		{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}.Development|x86.Build.0 = Development|Win32
 		{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}.Release|x64.ActiveCfg = Release|x64
@@ -140,7 +138,6 @@ Global
 		{B7399F39-300F-450E-F471-9490F959D2A7}.Release|x86.ActiveCfg = Release|Win32
 		{B7399F39-300F-450E-F471-9490F959D2A7}.Release|x86.Build.0 = Release|Win32
 		{6DEE3F12-F2F8-42CA-865A-578D0FD11387}.Development|x64.ActiveCfg = Development|x64
-		{6DEE3F12-F2F8-42CA-865A-578D0FD11387}.Development|x64.Build.0 = Development|x64
 		{6DEE3F12-F2F8-42CA-865A-578D0FD11387}.Development|x86.ActiveCfg = Development|Win32
 		{6DEE3F12-F2F8-42CA-865A-578D0FD11387}.Development|x86.Build.0 = Development|Win32
 		{6DEE3F12-F2F8-42CA-865A-578D0FD11387}.Release|x64.ActiveCfg = Release|x64
@@ -220,7 +217,6 @@ Global
 		{9E6B10A2-84B4-434D-ABDB-43BE4EA650F4}.Release|x86.ActiveCfg = Release|Win32
 		{9E6B10A2-84B4-434D-ABDB-43BE4EA650F4}.Release|x86.Build.0 = Release|Win32
 		{A8998B2D-652A-47F8-955B-5654B222B4EB}.Development|x64.ActiveCfg = Development|x64
-		{A8998B2D-652A-47F8-955B-5654B222B4EB}.Development|x64.Build.0 = Development|x64
 		{A8998B2D-652A-47F8-955B-5654B222B4EB}.Development|x86.ActiveCfg = Development|Win32
 		{A8998B2D-652A-47F8-955B-5654B222B4EB}.Development|x86.Build.0 = Development|Win32
 		{A8998B2D-652A-47F8-955B-5654B222B4EB}.Release|x64.ActiveCfg = Release|x64
@@ -244,7 +240,6 @@ Global
 		{257FD75C-4D17-4A23-A754-23BFD85887A0}.Release|x86.ActiveCfg = Release|Win32
 		{257FD75C-4D17-4A23-A754-23BFD85887A0}.Release|x86.Build.0 = Release|Win32
 		{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}.Development|x64.ActiveCfg = Development|x64
-		{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}.Development|x64.Build.0 = Development|x64
 		{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}.Development|x86.ActiveCfg = Development|Win32
 		{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}.Development|x86.Build.0 = Development|Win32
 		{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}.Release|x64.ActiveCfg = Release|x64

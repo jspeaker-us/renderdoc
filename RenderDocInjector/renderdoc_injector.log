@@ -2,11 +2,11 @@ Found renderdoc.dll at: D:\win\AInvertProject\renderdocx\x64\Development\renderd
 Creating process: D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands\Into The Emberlands.exe
 Command line: "D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands\Into The Emberlands.exe"
 Working directory: D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands
-Process created successfully (PID: 31236)
+Process created successfully (PID: 18732)
 Process is suspended, injecting DLL...
 Injecting DLL: D:\win\AInvertProject\renderdocx\x64\Development\renderdoc.dll
 Remote thread created, waiting for completion...
-DLL injected successfully! Module handle: 0x000000001BB20000
+DLL injected successfully! Module handle: 0x00000000E4030000
 Resuming process...
 ========================================
 SUCCESS!
