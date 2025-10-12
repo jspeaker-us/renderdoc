@@ -10,6 +10,7 @@ echo.
 
 REM 游戏路径（请根据需要修改）
 set GAME_EXE=D:\Program Files\EndField Launcher\EndField Game\Endfield_TBeta_OS.exe
+@REM set GAME_EXE=D:\BaiduNetdiskDownload\XJ06623\Into the Emberlands\Into The Emberlands.exe
 
 REM 查找注入器
 set INJECTOR=
